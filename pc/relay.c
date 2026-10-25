@@ -10,7 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/random.h>
+#include "compat.h"
 #include "cy_radio.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>

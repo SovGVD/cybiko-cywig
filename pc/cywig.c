@@ -16,10 +16,12 @@
  * lines back to the Cybikos around. */
 
 #include <errno.h>
+#ifndef _WIN32
 #include <poll.h>
+#endif
 #include <unistd.h>
 #include <signal.h>
-#include <sys/random.h>
+#include "compat.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +41,11 @@ cyusb_dev_t *cyusb_web_open(void);
 #endif
 #include "cy_gate.h"
 #ifndef __EMSCRIPTEN__
+#ifdef CYWIG_LIBCURL
+#include "cyb_net_libcurl.h"
+#else
 #include "cyb_net_curl.h"
+#endif
 #endif
 #include "../xtreme/proto.h"
 #include "cy_radio.h"
@@ -59,7 +65,12 @@ cyusb_dev_t *cyusb_web_open(void);
 static volatile sig_atomic_t stop;
 static int verbose;
 
-static void logf_(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+#ifdef __MINGW32__
+#define LOG_FORMAT gnu_printf          /* MinGW's printf is told to be the C99 one */
+#else
+#define LOG_FORMAT printf
+#endif
+static void logf_(const char *fmt, ...) __attribute__((format(LOG_FORMAT, 1, 2)));
 static void logf_(const char *fmt, ...)
 {
     time_t t = time(NULL);
@@ -243,6 +254,35 @@ EMSCRIPTEN_KEEPALIVE void cywig_chat(int on) { chat_asked = on; }
 EMSCRIPTEN_KEEPALIVE void cywig_stop(void) { stop = 1; }
 static void read_stdin(cywig_t *w)
 {
+    if (chat_asked < 0) return;
+    set_chat(w, chat_asked);
+    chat_asked = -1;
+}
+#elif defined _WIN32
+/* "chat on" / "chat off" typed while it runs: Windows can't poll a console,
+ * so a thread reads the lines and the loop takes what it left. */
+#include <pthread.h>
+static volatile int chat_asked = -1, bad_line;
+static void *stdin_thread(void *arg)
+{
+    char b[64];
+    (void)arg;
+    while (fgets(b, sizeof b, stdin)) {
+        b[strcspn(b, "\r\n")] = 0;
+        if (!strcmp(b, "chat on") || !strcmp(b, "chat off")) chat_asked = !strcmp(b, "chat on");
+        else if (*b) bad_line = 1;
+    }
+    return NULL;
+}
+static void read_stdin(cywig_t *w)
+{
+    static int started;
+    if (!started) {
+        pthread_t t;
+        started = 1;
+        if (!pthread_create(&t, NULL, stdin_thread, NULL)) pthread_detach(t);
+    }
+    if (bad_line) { bad_line = 0; logf_("type \"chat on\" or \"chat off\""); }
     if (chat_asked < 0) return;
     set_chat(w, chat_asked);
     chat_asked = -1;
@@ -462,6 +502,8 @@ static cyusb_dev_t *open_xtreme(const char *emulator, int quiet)
         tries++;
 #ifdef __EMSCRIPTEN__
         emscripten_sleep(200);
+#elif defined _WIN32
+        Sleep(200);
 #else
         usleep(200000);
 #endif
@@ -535,6 +577,8 @@ int main(int argc, char **argv)
     cyb_net_t net;
 #ifdef __EMSCRIPTEN__
     net_web_init(&net);
+#elif defined CYWIG_LIBCURL
+    cyb_net_libcurl(&net, NULL);
 #else
     cyb_net_curl(&net, NULL);
 #endif
