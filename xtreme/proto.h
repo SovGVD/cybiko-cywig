@@ -7,8 +7,8 @@
  * Numbers are big-endian, like everything on a Cybiko.
  *
  * From the Xtreme:
- *   UG_HELLO   version, gate mode on (1), own Cybiko ID (4), CyOS's
- *              name for itself ("USB Gate")
+ *   UG_HELLO   version, state (bit 0: gate mode on, bit 1: chat bridged),
+ *              own Cybiko ID (4), CyOS's name for itself ("USB Gate")
  *   UG_MSG     a message for the gate: sender ID (4), msg id (2), p0 (4),
  *              p1 (4), port it came to (2), its data
  *   UG_RESULT  how a UG_SEND went: tag (2), CyOS's delivery code (1:
@@ -16,9 +16,12 @@
  *   UG_LOG     a line of text for the PC's log
  * From the PC:
  *   UG_SEND    deliver a message: tag (2), to (Cybiko ID, 4), msg id (2),
- *              p0 (4), p1 (4), the process name (NUL-ended), its data
+ *              p0 (4), p1 (4), the process name (NUL-ended; "#25" is port
+ *              25), its data. To UG_BROADCAST for everyone around.
  *   UG_PING    answer with UG_HELLO
  *   UG_QUIT    stop the application
+ *   UG_CHAT    on (1) or off (0): take Chat's lines (port 25, RF channel 4)
+ *              and hand them over as UG_MSG, so the PC can pass them on
  */
 #pragma once
 
@@ -26,6 +29,8 @@
 #define UG_VERSION   1
 #define UG_PORT      0x93     /* the gate service's port */
 #define UG_MAX       2048     /* biggest payload */
+#define UG_CHAT_PORT 0x25     /* Chat's port */
+#define UG_BROADCAST 0xffffffffUL
 
 #define UG_HELLO     0x01
 #define UG_MSG       0x02
@@ -34,6 +39,10 @@
 #define UG_SEND      0x81
 #define UG_PING      0x82
 #define UG_QUIT      0x83
+#define UG_CHAT      0x84
+
+#define UG_STATE_GATE 0x01
+#define UG_STATE_CHAT 0x02
 
 /* Message_check_delivery */
 #define UG_DL_NONE    0

@@ -8,9 +8,16 @@
  * pages for Browser.app) and sends the answers back to be delivered over the
  * radio. Nothing on the Xtreme is changed: the cable carries CyOS's own
  * Multi Channel Protocol (cybiko-browser usb/cymcp.h), and this program
- * starts the application through CyOS's console. */
+ * starts the application through CyOS's console.
+ *
+ * With --chat it also bridges Chat to the Internet: the Xtreme hands over
+ * the chat lines it hears and this program passes them to a room of the
+ * radio relay that the Cybiko web emulator uses (relay.h), and the room's
+ * lines back to the Cybikos around. */
 
 #include <errno.h>
+#include <poll.h>
+#include <unistd.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -25,6 +32,13 @@
 #include "cy_gate.h"
 #include "cyb_net_curl.h"
 #include "../xtreme/proto.h"
+#include "cy_radio.h"
+#include "relay.h"
+#include <openssl/rand.h>
+
+#define RELAY_URL "https://cybiko-relay.sovgvd.workers.dev"
+#define RELAY_ORIGIN "https://sovgvd.github.io"   /* the web emulator's site */
+#define CHAT_TAG 0x8000                           /* UG_SEND tags of chat lines */
 
 #define PING_MS 3000
 #define APP_GONE_MS 8000
@@ -65,6 +79,13 @@ typedef struct {
     /* console output, a line at a time */
     char con[512];
     int con_len;
+    /* the chat bridge */
+    relay_t *relay;
+    int chat_want, chat_on;
+    uint16_t chat_tag;
+    struct { uint32_t from, p0; } seen[64];
+    int seen_at;
+    unsigned lines_out, lines_in;
 } cywig_t;
 
 static unsigned now(cywig_t *w) { return w->dev->now_ms(w->dev); }
@@ -118,6 +139,105 @@ static void gate_log(void *user, const char *line)
 
 /* ---- the Xtreme's side ---- */
 
+/* ---- the chat bridge ---- */
+
+static const char *room_name(int room)
+{
+    static const char *const names[] = { "General", "Romance", "Computing", "Sports", "Games", "Music" };
+    return room >= 0 && room < 6 ? names[room] : "a user room";
+}
+
+/* A line a Cybiko around said: to the room on the Internet, as that Cybiko. */
+static void chat_from_radio(cywig_t *w, uint32_t from, uint16_t msgid, uint32_t p0, uint32_t p1, const uint8_t *data, int len)
+{
+    char id[8];
+    cyr_cyid_str(from, id);
+    if (msgid != CYR_MSG_CHAT) {
+        logf_("Chat message %04x from @%s (%d bytes), not a line; not passed on", msgid, id, len);
+        return;
+    }
+    for (int i = 0; i < 64; i++)
+        if (w->seen[i].from == from && w->seen[i].p0 == p0) return;     /* a copy */
+    w->seen[w->seen_at].from = from;
+    w->seen[w->seen_at].p0 = p0;
+    w->seen_at = (w->seen_at + 1) % 64;
+    int tl = 0;
+    while (tl < len && tl < CYR_CHAT_MAX && data[tl]) tl++;
+    char text[CYR_CHAT_MAX + 1];
+    memcpy(text, data, (size_t)tl);
+    text[tl] = 0;
+    logf_("chat: @%s in %s: %s", id, room_name((int)p1), text);
+    if (!w->relay) return;
+    if (!relay_online(w->relay)) logf_("chat: not on the Internet now; that line stays here");
+    else { relay_say(w->relay, from, (int)p1, p0, text); w->lines_out++; }
+}
+
+/* A line from the room on the Internet: to the Cybikos around, from the
+ * Xtreme (that is who they hear), with the sender's name in front. */
+static void chat_from_relay(void *user, uint32_t from, const char *nick, int room, const char *text)
+{
+    cywig_t *w = user;
+    char id[8], line[CYR_CHAT_MAX + 1];
+    cyr_cyid_str(from, id);
+    if (*nick) snprintf(line, sizeof line, "%s: %s", nick, text);
+    else snprintf(line, sizeof line, "@%s: %s", id, text);
+    logf_("chat: Internet, %s: %s", room_name(room), line);
+    if (!w->app_up || !w->chat_on) {
+        logf_("chat: the Xtreme isn't bridging chat now; that line isn't passed on");
+        return;
+    }
+    uint8_t b[16 + 4 + sizeof line];
+    size_t tl = strlen(line) + 1;
+    uint32_t clock = now(w) | 1;     /* the line's clock: receivers drop its copies */
+    /* three times, like Chat does: a broadcast has no acknowledgement */
+    for (int copy = 0; copy < 3; copy++) {
+        w->chat_tag = (uint16_t)((w->chat_tag + 1) & ~CHAT_TAG);
+        put16(b, (unsigned)(CHAT_TAG | w->chat_tag));
+        put32(b + 2, UG_BROADCAST);
+        put16(b + 6, CYR_MSG_CHAT);
+        put32(b + 8, clock);
+        put32(b + 12, (uint32_t)room);
+        memcpy(b + 16, "#25", 4);
+        memcpy(b + 20, line, tl);
+        if (!send_rec(w, UG_SEND, b, (int)(20 + tl))) return;
+    }
+    w->lines_in++;
+}
+
+static void relay_log(void *user, const char *line)
+{
+    (void)user;
+    logf_("%s", line);
+}
+
+/* "chat on" / "chat off" typed while it runs */
+static void read_stdin(cywig_t *w)
+{
+    static char b[64];
+    static int bl;
+    struct pollfd p = { 0, POLLIN, 0 };
+    if (poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN)) return;
+    int r = (int)read(0, b + bl, sizeof b - 1 - (size_t)bl);
+    if (r <= 0) return;
+    bl += r;
+    b[bl] = 0;
+    char *nl;
+    while ((nl = strchr(b, '\n'))) {
+        *nl = 0;
+        if (!strcmp(b, "chat on") || !strcmp(b, "chat off")) {
+            w->chat_want = !strcmp(b, "chat on");
+            if (w->chat_want && !w->relay) logf_("chat: start with --chat to have the Internet side");
+            logf_("chat bridge: %s", w->chat_want ? "on" : "off");
+            if (w->app_up) { uint8_t on = (uint8_t)w->chat_want; send_rec(w, UG_CHAT, &on, 1); }
+        } else if (*b) {
+            logf_("type \"chat on\" or \"chat off\"");
+        }
+        bl -= (int)(nl + 1 - b);
+        memmove(b, nl + 1, (size_t)bl + 1);
+    }
+    if (bl == (int)sizeof b - 1) bl = 0;
+}
+
 static void record(cywig_t *w, const uint8_t *r, int len)
 {
     const uint8_t *p = r + 4;
@@ -127,21 +247,37 @@ static void record(cywig_t *w, const uint8_t *r, int len)
         if (n < 6) break;
         if (!w->app_up || w->xtreme_id != get32(p + 2))
             logf_("USB Gate running on Cybiko %08x (version %d, gate mode %s)", (unsigned)get32(p + 2), p[0],
-                  p[1] ? "on" : "OFF");
+                  p[1] & UG_STATE_GATE ? "on" : "OFF");
+        if (w->app_up && !!(p[1] & UG_STATE_CHAT) != w->chat_on)
+            logf_("chat bridge %s on the Xtreme", p[1] & UG_STATE_CHAT ? "on" : "off");
         w->xtreme_id = get32(p + 2);
         w->app_up = 1;
         w->hello_at = now(w);
+        w->chat_on = !!(p[1] & UG_STATE_CHAT);
+        if (w->chat_on != w->chat_want) {
+            uint8_t on = (uint8_t)w->chat_want;
+            send_rec(w, UG_CHAT, &on, 1);
+        }
         return;
     case UG_MSG:
         if (n < 16) break;
         if (verbose)
             logf_("<- %08x msg %04x p0 %08x p1 %08x port %x, %d bytes", (unsigned)get32(p), get16(p + 4),
                   (unsigned)get32(p + 6), (unsigned)get32(p + 10), get16(p + 14), n - 16);
-        cy_gate_msg_in(w->gate, get32(p), (uint16_t)get16(p + 4), get32(p + 6), get32(p + 10), p + 16, (size_t)(n - 16));
+        if (get16(p + 14) == UG_CHAT_PORT) chat_from_radio(w, get32(p), (uint16_t)get16(p + 4), get32(p + 6), get32(p + 10),
+                                                           p + 16, n - 16);
+        else cy_gate_msg_in(w->gate, get32(p), (uint16_t)get16(p + 4), get32(p + 6), get32(p + 10), p + 16, (size_t)(n - 16));
         return;
     case UG_RESULT: {
         if (n < 3) break;
         int code = p[2];
+        if (get16(p) & CHAT_TAG) {
+            if (code != UG_DL_SUCCESS || verbose)
+                logf_("chat send %u to the Cybikos around: %s", get16(p) & ~CHAT_TAG,
+                      code == UG_DL_SUCCESS ? "sent" : code == UG_DL_ABORT ? "nobody took it" :
+                      code == UG_DL_TIMEOUT ? "timed out" : "failed");
+            return;
+        }
         if (!w->sending || get16(p) != w->tag) {
             logf_("delivery result %d for send %u, not the one waiting (%u)", code, get16(p), w->tag);
             return;
@@ -217,6 +353,8 @@ static int run(cywig_t *w)
         if (cymcp_poll(w->link, 20) < 0) { logf_("the Xtreme went away"); return 1; }
         read_console(w);
         read_records(w);
+        if (w->relay) relay_poll(w->relay);
+        read_stdin(w);
         uint32_t wait = cy_gate_poll(w->gate, t);
         (void)wait;
         if (w->app_up && (int)(t - w->hello_at) > APP_GONE_MS) {   /* signed: a HELLO can be newer than t */
@@ -252,17 +390,27 @@ static void usage(const char *me)
             "  --home URL            the page for the WAP browser's Home\n"
             "  --flash FILE          a CyOS flash image, for its fonts (pages for Browser.app\n"
             "                        are laid out with them; without it, close stand-ins)\n"
+            "  --chat                bridge Chat to the Internet (type \"chat off\" / \"chat on\" to switch)\n"
+            "  --room NAME           the relay's room (default public, the web emulator's)\n"
+            "  --relay URL           the relay (default " RELAY_URL ")\n"
+            "  --nick NAME           the bridge's nickname in the room (default USBGate)\n"
             "  -v                    log every message\n", me);
 }
 
 int main(int argc, char **argv)
 {
     const char *emulator = NULL, *home = NULL, *flash = NULL;
+    const char *relay_url = RELAY_URL, *room = "public", *nick = "USBGate";
+    int chat = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--emulator") && v) { emulator = v; i++; }
         else if (!strcmp(a, "--home") && v) { home = v; i++; }
         else if (!strcmp(a, "--flash") && v) { flash = v; i++; }
+        else if (!strcmp(a, "--chat")) chat = 1;
+        else if (!strcmp(a, "--room") && v) { room = v; i++; }
+        else if (!strcmp(a, "--relay") && v) { relay_url = v; i++; }
+        else if (!strcmp(a, "--nick") && v) { nick = v; i++; }
         else if (!strcmp(a, "-v")) verbose = 1;
         else { usage(argv[0]); return 2; }
     }
@@ -303,7 +451,23 @@ int main(int argc, char **argv)
         cy_gate_set_fonts(w.gate, img, n);
     }
 
+    if (chat) {
+        relay_host_t rh = { &w, chat_from_relay, relay_log };
+        /* the bridge's own seat in the room: an ID of its own (the 4c
+         * prefix every Cybiko ID has, then random bits) */
+        uint32_t id;
+        RAND_bytes((unsigned char *)&id, sizeof id);
+        id = 0x4c000000u | (id & 0xffffff);
+        w.relay = relay_create(relay_url, room, RELAY_ORIGIN, id, nick, &rh);
+        w.chat_want = 1;
+        logf_("chat bridge on: room %s of %s", room, relay_url);
+    }
+
     int r = run(&w);
+    if (w.relay) {
+        logf_("chat: %u lines to the Internet, %u from it", w.lines_out, w.lines_in);
+        relay_destroy(w.relay);
+    }
     const cymcp_stats_t *k = cymcp_stats(w.link);
     logf_("cable: %u frames in, %u out, %u resent, %u bad, %u unexpected", (unsigned)k->frames_in,
           (unsigned)k->frames_out, (unsigned)k->resent, (unsigned)k->bad, (unsigned)k->unexpected);

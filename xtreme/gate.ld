@@ -15,3 +15,6 @@ _cy_Queue_peek_message = 0xf00000 + 940;
 _cy_radio_power = 0xf00000 + 1109;      /* (on): 49fc70, wakes the radio up */
 _cy_radio = 0xf00000 + 888;             /* data: the radio's object */
 _cy_radio_ping = 0xf00000 + 1079;       /* (radio, RF channel): 49db50, sends a ping */
+_cy_rf = 0xf00000 + 1044;               /* data: the radio's channel object */
+_cy_rf_set_channel = 0xf00000 + 1161;   /* (rf, RF channel 2..9): 49ca04 */
+_cy_rf_channel = 0xf00000 + 1072;       /* (rf): 49ca66 */

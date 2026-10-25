@@ -12,15 +12,25 @@ on its USB cable. It needs no ROM or flash changes.
   [cybiko-browser](https://github.com/SovGVD/cybiko-browser) (`cy_gate`). It
   fetches pages and turns them into WML for the WAP browser, or into laid-out
   pages for Browser.app.
+- **Chat over the Internet** (`cywig --chat`): the Xtreme also passes on
+  the Chat lines it hears, and cywig joins a room of the radio relay that the
+  [Cybiko web emulator](https://github.com/SovGVD/cybiko-web-emulator) uses
+  (`cybiko-relay.sovgvd.workers.dev`, room `public`). Lines from the Cybikos
+  around show up in the web emulators as those Cybikos' own (`@ID`), and the
+  room's lines reach the Cybikos around from the Xtreme, with the sender's
+  nickname in front ("Bob: hi"). Type `chat off` / `chat on` while cywig runs
+  to switch it.
 
-Status: works in the emulator; not tested on a real Xtreme yet. The chat
-bridge to the internet relay is not written yet.
+Status: pages and chat both ways work in the emulator (a radio Cybiko, the
+emulated Xtreme on the cable, and a local copy of the relay). Not tested on a
+real Xtreme yet, and the real Cloudflare relay wasn't reachable from where it
+was built.
 
 ## Build
 
 ```sh
 git submodule update --init
-make            # build/cywig (needs libusb-1.0 and curl)
+make            # build/cywig and build/chat_peer (needs libusb-1.0, OpenSSL and curl)
 make xtreme     # xtreme/USBGate.app (needs gcc-h8300-hms)
 ```
 
@@ -31,15 +41,37 @@ make xtreme     # xtreme/USBGate.app (needs gcc-h8300-hms)
    the CyOS console when the app isn't running.
 3. On another Cybiko, open the WAP browser or Browser.app.
 
+Options: `--chat` (bridge Chat), `--room NAME`, `--relay URL`, `--nick NAME`
+(the bridge's name in the room), `--home URL` (the WAP browser's Home),
+`--flash FILE` (a CyOS flash image, for the fonts Browser.app pages are laid
+out with), `-v` (log every message).
+
 To test without hardware, run the Dragonfruit emulator with
-`cybiko_host --usb-server 5555 --install xtreme/USBGate.app ...`, then
-`build/cywig --emulator 127.0.0.1:5555 -v`.
+`cybiko_host --usb-server 5555 --install xtreme/USBGate.app --bot Bob --bot-get 35000:URL --bot-say 40000:hi`,
+then `build/cywig --emulator 127.0.0.1:5555 --chat -v`. `build/chat_peer
+--nick Ann --say 5000:hello` sits in a relay room as one more Cybiko and
+prints what it hears; `node proxy/local.mjs` from the web emulator is a relay
+on your own computer (`--relay http://127.0.0.1:8080`).
+
+How USB Gate does it on a stock Xtreme (CyOS 1.5.08 only, it uses kernel
+exports and two kernel structures directly):
+
+- gate mode on (export 1152), so CyOS marks everything it sends as a gate's;
+- a ping every 3 s on the base channel (export 1079), as an idle Xtreme
+  never pings and nobody would find the gate;
+- a queue for port 93 (a process made with the port as its name, never
+  started) and the MCP pipe 40 to the PC (exports 1680, 1604-1628);
+- with Chat bridged: the radio on RF channel 4 (export 1161), and the chat
+  lines taken from the queue a resident part of CyOS keeps for port 25
+  (only messages 1002; it is found in CyOS's ring of port queues).
 
 The USB protocol and the CyOS exports used here are described in
 [cybiko-docs](https://github.com/SovGVD/cybiko-docs) `usb.md`.
 
 ## Credits
 
+- `pc/cy_radio` is Dragonfruit's radio protocol library; the protocol was
+  worked out from CyOS's code and traces (cybiko-docs `radio-protocol.md`).
 - Tim Schuerewegen: the MAME Cybiko driver, which documents the hardware
   (including the USBN9604 USB chip) that this work and the Dragonfruit emulator
   build on.

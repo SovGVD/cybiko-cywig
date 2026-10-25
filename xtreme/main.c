@@ -32,6 +32,11 @@ void cy_radio_power(u8 on);
 extern void *cy_radio;
 void cy_radio_ping(void *radio, u8 channel);
 #define RF_BASE 2   /* where Cybikos look for a gate */
+#define RF_CHAT 4   /* where Chat's rooms are */
+#define MSG_CHAT_LINE 0x1002
+extern void *cy_rf;                       /* the radio's channel object */
+void cy_rf_set_channel(void *rf, u8 channel);
+u8 cy_rf_channel(void *rf);
 struct Message *cy_Queue_peek_message(struct Queue *q, int remove, int min, int max);
 
 /* an IPipe's methods (CyOS's console and loader call them this way) */
@@ -43,6 +48,17 @@ static void *app_vt[20];
 static struct Process *me;
 static u32 port_mem[PROCESS_SIZE / 4];
 static struct Process *port;          /* only its queue: port 93's messages */
+static struct Queue *chat;            /* CyOS's port 25 queue, while bridged */
+static volatile u8 chat_want;         /* what the PC asked for */
+static u8 chat_channel_before;
+
+/* CyOS's queues that take messages for a port (CyOS 1.5.08): a ring at
+ * *(radio + b8c) (the last queue), next at +34, the port at +28; the first
+ * one for a port gets its messages */
+#define PORT_QUEUES(radio) ((char **)((char *)(radio) + 0xb8c))
+#define QUEUE_NEXT(q) (*(char **)((q) + 0x34))
+#define QUEUE_PORT(q) (*(u32 *)((q) + 0x28))
+
 static u32 rd_mem[PROCESS_SIZE / 4];
 static void *rd_vt[20];
 static struct Process *rd;
@@ -51,16 +67,19 @@ static void *pipe_, *in, *out;
 static volatile u8 quitting, rd_done;
 
 /* sends waiting for their delivery: the reader fills a slot (state 1 ->
- * 2), the application thread reports and frees it (2 -> 0) */
+ * 2), the application thread reports and frees it (2 -> 0). Broadcasts are
+ * posted (CyOS owns the message then) and nobody answers them: state 3,
+ * freed a while later, when its buffer has surely gone out. */
 static struct {
     volatile u8 state;
     u16 tag;
     struct Message *m;
     struct Buffer buf;
 } pend[PENDING];
+static long posted_at[PENDING];
 
 /* what the screen shows */
-static long requests, answers, failed;
+static long requests, answers, failed, chat_lines;
 static volatile long pc_heard;        /* time of the last record from the PC */
 static long now_ms;
 static u8 dirty = 1;
@@ -90,7 +109,7 @@ static void hello(void)
     const char *name = "USB Gate";
     int n = 0;
     tx[4] = UG_VERSION;
-    tx[5] = cy_get_gate_mode();
+    tx[5] = (cy_get_gate_mode() ? UG_STATE_GATE : 0) | (chat ? UG_STATE_CHAT : 0);
     put32(tx + 6, (u32)cy_get_own_id());
     while (name[n]) { tx[10 + n] = (u8)name[n]; n++; }
     send_rec(UG_HELLO, 6 + n);
@@ -125,7 +144,8 @@ static void forward(struct Message *m)
     put32(p + 10, (u32)m->param[1]);
     put16(p + 14, (u16)(u32)m->dst_name);
     send_rec(UG_MSG, 16 + (int)size);
-    requests++;
+    if ((u32)m->dst_name == UG_CHAT_PORT) chat_lines++;
+    else requests++;
     dirty = 1;
 }
 
@@ -134,6 +154,14 @@ static void results(void)
     int i;
     for (i = 0; i < PENDING; i++) {
         int st;
+        if (pend[i].state == 3 && now_ms - posted_at[i] > 3000) {
+            put16(tx + 4, pend[i].tag);
+            tx[6] = UG_DL_SUCCESS;
+            tx[7] = 0;
+            send_rec(UG_RESULT, 4);
+            pend[i].state = 0;
+            continue;
+        }
         if (pend[i].state != 2) continue;
         st = cy_Message_check_delivery(pend[i].m);
         if (st < UG_DL_ABORT && st != UG_DL_NONE) continue;
@@ -171,6 +199,20 @@ static u8 read_all(u8 *p, int n)
     return 1;
 }
 
+/* "#25" is port 25 (CyOS takes a port as a name below 0x100) */
+static const char *dest(const char *name)
+{
+    unsigned v = 0;
+    const char *c = name + 1;
+    if (name[0] != '#' || !*c) return name;
+    for (; *c; c++) {
+        if (*c >= '0' && *c <= '9') v = v * 16 + (unsigned)(*c - '0');
+        else if (*c >= 'a' && *c <= 'f') v = v * 16 + (unsigned)(*c - 'a' + 10);
+        else return name;
+    }
+    return v && v < 0x100 ? (const char *)(unsigned long)v : name;
+}
+
 static void do_send(int len)
 {
     struct Message *m;
@@ -198,7 +240,15 @@ static void do_send(int len)
         cy_Buffer_store(&pend[slot].buf, rx + 16 + nl + 1, 0, (u32)dl);
         cy_Message_attach_buffer(m, &pend[slot].buf);
     }
-    cy_Message_deliver(m, name, (cyid_t)get32(rx + 2), DELIVER_MS);
+    if (get32(rx + 2) == UG_BROADCAST) {
+        /* to everyone around: nobody acknowledges it, so it is posted */
+        cy_Message_post(m, dest(name), (cyid_t)UG_BROADCAST);
+        pend[slot].m = 0;
+        posted_at[slot] = now_ms;
+        pend[slot].state = 3;
+        return;
+    }
+    cy_Message_deliver(m, dest(name), (cyid_t)get32(rx + 2), DELIVER_MS);
     pend[slot].m = m;
     pend[slot].state = 2;
 }
@@ -214,6 +264,7 @@ static void reader(struct Process *p)
         pc_heard = now_ms ? now_ms : 1;
         if (h[0] == UG_SEND) do_send(len);
         else if (h[0] == UG_QUIT) quitting = 1;
+        else if (h[0] == UG_CHAT && len >= 1) chat_want = rx[0];
         /* UG_PING: the application thread says hello on its own */
     }
     rd_done = 1;
@@ -239,17 +290,65 @@ static void paint(void)
     cy_Graphics_set_font(gfx, cy_cool_normal_font);
     line(20, pc ? "PC: connected" : "PC: waiting for it");
     line(34, cy_get_gate_mode() ? "Gate for Cybikos around" : "Gate mode off");
+    if (chat) cy_sprintf(s, "Chat bridged: %ld lines out", chat_lines);
+    line(76, chat ? s : "Chat: not bridged");
     cy_sprintf(s, "Requests %ld", requests);
     line(48, s);
     cy_sprintf(s, "Answers %ld, failed %ld", answers, failed);
     line(62, s);
     cy_Graphics_set_font(gfx, cy_mini_normal_font);
-    line(86, "Esc: stop the gate");
+    line(90, "Esc: stop the gate");
     cy_DisplayGraphics_show(gfx);
     dirty = 0;
 }
 
 /* ---- the application ---- */
+
+/* CyOS's own queue for port 25: a resident part of CyOS takes the port
+ * at start-up (and whatever else it gets there must stay its own). */
+static struct Queue *chat_queue(void)
+{
+    char **ring = cy_radio ? PORT_QUEUES(cy_radio) : 0;
+    char *q;
+    int k = 0;
+    if (!ring || !*ring) return 0;
+    q = *ring;
+    do {
+        q = QUEUE_NEXT(q);
+        if (QUEUE_PORT(q) == UG_CHAT_PORT) return (struct Queue *)q;
+    } while (q != *ring && ++k < 200);
+    return 0;
+}
+
+/* Chat bridged or not, as the PC wants. Chat's rooms are on RF channel 4,
+ * so the radio moves there; Cybikos send to the gate on the channel its
+ * pings name, so the gate keeps working. */
+static void chat_switch(void)
+{
+    char s[48];
+    if (chat_want && !chat) {
+        chat = chat_queue();
+        if (!chat) {
+            log_line("chat: CyOS has no queue for port 25; can't bridge");
+            chat_want = 0;
+            return;
+        }
+        if (cy_rf) {
+            chat_channel_before = cy_rf_channel(cy_rf);
+            cy_rf_set_channel(cy_rf, RF_CHAT);
+        }
+        cy_sprintf(s, "chat on: RF channel %d (was %d)", RF_CHAT, chat_channel_before);
+        log_line(s);
+        hello();
+        dirty = 1;
+    } else if (!chat_want && chat) {
+        chat = 0;
+        if (cy_rf && chat_channel_before) cy_rf_set_channel(cy_rf, chat_channel_before);
+        log_line("chat off");
+        hello();
+        dirty = 1;
+    }
+}
 
 static void run(struct Process *p)
 {
@@ -302,13 +401,23 @@ static void run(struct Process *p)
             forward(m);
             cy_Message_delete(m);
         }
+        /* only the chat lines: the rest there is for whoever owns the port */
+        while (chat && (m = cy_Queue_peek_message(chat, 1, MSG_CHAT_LINE, MSG_CHAT_LINE)) != 0) {
+            forward(m);
+            cy_Message_delete(m);
+        }
+        if (out && chat_want != (chat != 0)) chat_switch();
         results();
         if (now_ms >= next_hello) {
             next_hello = now_ms + HELLO_MS;
             /* An idle Xtreme doesn't ping, and a gate nobody hears isn't
              * one: ping every 3 s (with the gate flag, gate mode adds it). */
             cy_radio_power(1);
-            if (cy_radio) cy_radio_ping(cy_radio, RF_BASE);
+            if (cy_radio) {
+                cy_radio_ping(cy_radio, RF_BASE);
+                /* and where it works, which leaves the radio tuned there */
+                if (chat) cy_radio_ping(cy_radio, RF_CHAT);
+            }
             if (out) hello();
         }
         if ((pc_heard && now_ms - pc_heard < PC_GONE_MS) != was_pc) { was_pc = !was_pc; dirty = 1; }
@@ -323,6 +432,8 @@ static void run(struct Process *p)
     for (i = 0; i < PENDING; i++)
         if (pend[i].state == 2) cy_Message_delete(pend[i].m);
     cy_Process_dtor(port, LEAVE_MEMORY);
+    chat_want = 0;
+    chat_switch();
     if (pipe_) cy_PipeFactory_release(cy_mcp_pipe_factory, pipe_, 0);
     *(u16 *)((char *)p + 0x4c) |= 4;    /* have the desktop drawn again */
 }
