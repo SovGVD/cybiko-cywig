@@ -622,6 +622,9 @@ int main(int argc, char **argv)
         if (!w.dev) break;
         logf_("Xtreme back on the cable");
         w.link = cymcp_open(w.dev);
+        /* USB Gate, just started, drops the old link: give it its time
+         * on the new one before starting it again */
+        if (!w.app_up && w.starts) w.started_at = now(&w);
     }
     if (!w.link) {
         cy_gate_destroy(w.gate);

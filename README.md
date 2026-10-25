@@ -151,6 +151,33 @@ cywig and the page open either ID. Verified only in Dragonfruit's emulator,
 whose USB host enumerates like Windows and logs the descriptors (the
 `--usb` script step `reenum` waits for a drop-off and enumerates again).
 
+## What it looks like
+
+These are from Dragonfruit's emulator (the Xtreme screen at 3x, pixels kept
+square) and headless Chrome; the Windows picture is drawn, not a screenshot,
+since it hasn't run on real Windows yet.
+
+USB Gate on the Xtreme, before and after the PC picks it up. The bottom line
+says "USB: ready for Windows" when the WinUSB descriptors are in place (on
+another CyOS it says "Esc: stop the gate" only):
+
+![USB Gate waiting for the PC](docs/images/usbgate-waiting.png)
+![USB Gate connected](docs/images/usbgate-connected.png)
+
+The web page while it runs. The log ends with "USB Gate running on Cybiko
+... on USB as 0b66:0042, WinUSB for Windows"; "the Xtreme went away" and
+"Xtreme back on the cable" just before it are the 400 ms drop-off, not an
+error:
+
+![The web page running](docs/images/web-page-running.png)
+
+Windows Device Manager while USB Gate runs: "Cybiko Xtreme" under Universal
+Serial Bus devices, hardware ID `USB\VID_0B66&PID_0042`, driver WinUSB. If it
+shows up under Other devices with a yellow mark instead, Windows didn't take
+the descriptors; please send the hardware IDs from the Details tab.
+
+![Windows Device Manager (illustration)](docs/images/windows-device-manager.png)
+
 ## Credits
 
 - `pc/cy_radio` is Dragonfruit's radio protocol library; the protocol was
