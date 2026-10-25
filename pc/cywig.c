@@ -219,17 +219,17 @@ static int run(cywig_t *w)
         read_records(w);
         uint32_t wait = cy_gate_poll(w->gate, t);
         (void)wait;
-        if (w->app_up && t - w->hello_at > APP_GONE_MS) {
+        if (w->app_up && (int)(t - w->hello_at) > APP_GONE_MS) {   /* signed: a HELLO can be newer than t */
             logf_("USB Gate stopped answering");
             w->app_up = 0;
             started_at = 0;
             starts = 0;
         }
-        if ((int)(t - next_ping) >= 0) {
+        if (w->app_up && (int)(t - next_ping) >= 0) {
             next_ping = t + PING_MS;
             send_rec(w, UG_PING, NULL, 0);
         }
-        if (!w->app_up && (!started_at || t - started_at > 6000)) {
+        if (!w->app_up && (!started_at || (int)(t - started_at) > 6000)) {
             if (starts++ >= START_TRIES) {
                 logf_("USB Gate does not start: is %s on the Xtreme?", APP_NAME);
                 starts = 0;

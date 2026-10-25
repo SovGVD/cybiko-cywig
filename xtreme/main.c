@@ -28,6 +28,10 @@ u8 cy_MCPOutput_flush(void *out);
 long cy_MCPOutput_write(void *out, const void *buf, long len);
 void cy_set_gate_mode(u8 on);
 u8 cy_get_gate_mode(void);
+void cy_radio_power(u8 on);
+extern void *cy_radio;
+void cy_radio_ping(void *radio, u8 channel);
+#define RF_BASE 2   /* where Cybikos look for a gate */
 struct Message *cy_Queue_peek_message(struct Queue *q, int remove, int min, int max);
 
 /* an IPipe's methods (CyOS's console and loader call them this way) */
@@ -263,6 +267,7 @@ static void run(struct Process *p)
     }
     port = cy_Process_ctor(port_mem, (const char *)UG_PORT, 512);
     cy_set_gate_mode(1);
+    cy_radio_power(1);
     if (in) {
         rd = cy_Process_ctor(rd_mem, "UGateRd", 1500);
         for (i = 0; i < 20; i++) rd_vt[i] = PROCESS_VTABLE(rd)[i];
@@ -300,6 +305,10 @@ static void run(struct Process *p)
         results();
         if (now_ms >= next_hello) {
             next_hello = now_ms + HELLO_MS;
+            /* An idle Xtreme doesn't ping, and a gate nobody hears isn't
+             * one: ping every 3 s (with the gate flag, gate mode adds it). */
+            cy_radio_power(1);
+            if (cy_radio) cy_radio_ping(cy_radio, RF_BASE);
             if (out) hello();
         }
         if ((pc_heard && now_ms - pc_heard < PC_GONE_MS) != was_pc) { was_pc = !was_pc; dirty = 1; }

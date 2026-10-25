@@ -12,3 +12,6 @@ _cy_MCPOutput_write = 0xf00000 + 1628;   /* (stream, buffer, length) */
 _cy_set_gate_mode = 0xf00000 + 1152;
 _cy_get_gate_mode = 0xf00000 + 718;
 _cy_Queue_peek_message = 0xf00000 + 940;
+_cy_radio_power = 0xf00000 + 1109;      /* (on): 49fc70, wakes the radio up */
+_cy_radio = 0xf00000 + 888;             /* data: the radio's object */
+_cy_radio_ping = 0xf00000 + 1079;       /* (radio, RF channel): 49db50, sends a ping */
