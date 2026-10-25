@@ -12,6 +12,8 @@ on its USB cable. It needs no ROM or flash changes.
   [cybiko-browser](https://github.com/SovGVD/cybiko-browser) (`cy_gate`). It
   fetches pages and turns them into WML for the WAP browser, or into laid-out
   pages for Browser.app.
+- `web/`: the same cywig as a **web page**, nothing to install: Chrome or
+  Edge talk to the Xtreme with WebUSB, see [In a web browser](#in-a-web-browser).
 - **Chat over the Internet** (`cywig --chat`): the Xtreme also passes on
   the Chat lines it hears, and cywig joins a room of the radio relay that the
   [Cybiko web emulator](https://github.com/SovGVD/cybiko-web-emulator) uses
@@ -21,7 +23,8 @@ on its USB cable. It needs no ROM or flash changes.
   nickname in front ("Bob: hi"). Type `chat off` / `chat on` while cywig runs
   to switch it.
 
-Status: pages and chat both ways work in the emulator (a radio Cybiko, the
+Status: pages and chat both ways work in the emulator, from cywig and from
+the web page in headless Chrome (a radio Cybiko, the
 emulated Xtreme on the cable, and a local copy of the relay). Not tested on a
 real Xtreme yet, and the real Cloudflare relay wasn't reachable from where it
 was built.
@@ -52,6 +55,34 @@ then `build/cywig --emulator 127.0.0.1:5555 --chat -v`. `build/chat_peer
 --nick Ann --say 5000:hello` sits in a relay room as one more Cybiko and
 prints what it hears; `node proxy/local.mjs` from the web emulator is a relay
 on your own computer (`--relay http://127.0.0.1:8080`).
+
+## In a web browser
+
+<https://sovgvd.github.io/cybiko-cywig/> runs cywig in the page (WebAssembly
+in a worker, so it keeps going in a background tab). Copy `USBGate.app` to
+the Xtreme (the page has a link to it), plug it in, press **Connect** and
+pick the Cybiko. The settings (Chat, room, nickname, Home page) are under
+Settings; fetching and Chat go through the web emulator's Cloudflare Worker.
+
+It needs a browser with WebUSB: Chrome, Edge or another Chromium, on a
+computer or on Android with an OTG cable (not Firefox or Safari).
+
+- **Windows**: WebUSB can only open a device that has the WinUSB driver.
+  Install it once with [Zadig](https://zadig.akeo.ie/): Options -> List All
+  Devices, pick the Cybiko (USB ID `0B66 0041`), choose WinUSB, Install
+  Driver. (EZ Loader uses its own driver, so to use EZ Loader again, put that
+  one back in Device Manager.)
+- **Linux**: allow your user to open it, e.g. `/etc/udev/rules.d/50-cybiko.rules`
+  with `SUBSYSTEM=="usb", ATTR{idVendor}=="0b66", MODE="0666"`, then plug it in again.
+- **macOS, ChromeOS, Android**: nothing to set up.
+
+Build it with Emscripten (`source emsdk_env.sh`, then `sh web/build.sh`;
+the Pages workflow does that on every push to main) and serve `web/site/`
+over https or from localhost. To try it without an Xtreme, run
+`cybiko_host --usb-server 5555 --install xtreme/USBGate.app ...` as below,
+`node web/dev-bridge.mjs` (it serves the page and passes a WebSocket to the
+emulator), and open
+`http://localhost:8090/?emulator=ws://localhost:8090/usb`.
 
 How USB Gate does it on a stock Xtreme (CyOS 1.5.08 only, it uses kernel
 exports and two kernel structures directly):

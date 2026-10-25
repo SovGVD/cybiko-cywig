@@ -1,15 +1,42 @@
-/* Chat over the radio relay, see relay.h. */
+/* Chat over the radio relay, see relay.h. On a PC a thread of its own
+ * talks to the relay (ws.c); in a web page (Emscripten) the page's
+ * WebSocket does (Module.relay in web/app.js) and relay_poll does the
+ * rest. */
 #include "relay.h"
 
-#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <openssl/rand.h>
+#include <unistd.h>
+#include <sys/random.h>
 #include "cy_radio.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+typedef int pthread_mutex_t;
+#define pthread_mutex_lock(m) ((void)0)
+#define pthread_mutex_unlock(m) ((void)0)
+#define pthread_mutex_init(m, a) ((void)0)
+#define pthread_mutex_destroy(m) ((void)0)
+EM_JS(void, js_relay_open, (const char *url), { Module.relay.open(UTF8ToString(url)); });
+EM_JS(void, js_relay_close, (void), { Module.relay.close(); });
+EM_JS(int, js_relay_online, (void), { return Module.relay.online() ? 1 : 0; });
+EM_JS(void, js_relay_send, (const uint8_t *p, int n), { Module.relay.send(HEAPU8.slice(p, p + n)); });
+/* the next message from the room: its length, 0 when none, -2 for a text
+ * one (its text in the buffer) */
+EM_JS(int, js_relay_next, (uint8_t *p, int cap), {
+    const m = Module.relay.next();
+    if (!m) return 0;
+    if (typeof m === "string") { stringToUTF8(m, p, cap); return -2; }
+    const n = Math.min(m.length, cap);
+    HEAPU8.set(m.subarray(0, n), p);
+    return n;
+});
+#else
+#include <pthread.h>
 #include "ws.h"
+#endif
 
 #define PING_MS 5000
 #define COPIES 3                /* a broadcast line goes three times */
@@ -34,11 +61,14 @@ struct relay {
     uint8_t version;
     relay_host_t host;
 
+#ifndef __EMSCRIPTEN__
     pthread_t thread;
+    ws_t *ws;
+#endif
     pthread_mutex_t mu;
     volatile int quit;
     volatile int online;
-    ws_t *ws;
+    uint32_t next_ping;
     uint32_t tab, seq;
 
     /* to send: packets and when */
@@ -97,7 +127,11 @@ static void send_now(relay_t *r, const uint8_t *pkt, size_t len, uint8_t channel
     r->seq++;
     f[8] = channel;
     memcpy(f + 9, pkt, len);
+#ifdef __EMSCRIPTEN__
+    if (js_relay_online()) js_relay_send(f, (int)(9 + len));
+#else
     if (r->ws && ws_send(r->ws, f, 9 + len) < 0) logf_r(r, "relay: send failed: %s", ws_error(r->ws));
+#endif
 }
 
 static const char *nick_of(relay_t *r, uint32_t id)
@@ -199,10 +233,36 @@ static void packet(relay_t *r, const uint8_t *pkt, size_t len, uint8_t channel)
     pthread_mutex_unlock(&r->mu);
 }
 
+/* Pings and what is due to go out (locked by the caller). */
+static void tick(relay_t *r, uint32_t t)
+{
+    if ((int32_t)(t - r->next_ping) >= 0) {
+        uint8_t p[CYR_SHORT];
+        r->next_ping = t + PING_MS;
+        send_now(r, p, cyr_ping(p, r->id, CYR_RF_CHAT, r->version, r->nick, -1, false), CYR_RF_BASE);
+        send_now(r, p, cyr_ping(p, r->id, CYR_RF_CHAT, r->version, r->nick, -1, false), CYR_RF_CHAT);
+    }
+    for (int i = 0; i < r->nout;) {
+        if ((int32_t)(t - r->out[i].at) >= 0) {
+            send_now(r, r->out[i].pkt, r->out[i].len, r->out[i].channel);
+            r->out[i] = r->out[--r->nout];
+        } else {
+            i++;
+        }
+    }
+}
+
+static void frame_in(relay_t *r, const uint8_t *f, int n)
+{
+    if (n == 9 + CYR_SHORT || n == 9 + CYR_LONG) packet(r, f + 9, (size_t)n - 9, f[8]);
+    else logf_r(r, "relay: a %d-byte message from the room is not a packet; ignored", n);
+}
+
+#ifndef __EMSCRIPTEN__
 static void *run(void *arg)
 {
     relay_t *r = arg;
-    uint32_t next_ping = 0, retry_at = 0, wait = 1000;
+    uint32_t retry_at = 0, wait = 1000;
     static uint8_t f[70000];
     while (!r->quit) {
         uint32_t t = now_ms();
@@ -225,7 +285,7 @@ static void *run(void *arg)
             pthread_mutex_unlock(&r->mu);
             r->online = 1;
             wait = 1000;
-            next_ping = t;
+            r->next_ping = t;
             logf_r(r, "relay: joined %s", r->url);
         }
         int n = ws_recv(r->ws, f, sizeof f, 50);
@@ -241,29 +301,15 @@ static void *run(void *arg)
             retry_at = now_ms() + wait;
             continue;
         } else if (n > 0) {
-            if (n == 9 + CYR_SHORT || n == 9 + CYR_LONG) packet(r, f + 9, (size_t)n - 9, f[8]);
-            else logf_r(r, "relay: a %d-byte message from the room is not a packet; ignored", n);
+            frame_in(r, f, n);
         }
-        t = now_ms();
         pthread_mutex_lock(&r->mu);
-        if ((int32_t)(t - next_ping) >= 0) {
-            uint8_t p[CYR_SHORT];
-            next_ping = t + PING_MS;
-            send_now(r, p, cyr_ping(p, r->id, CYR_RF_CHAT, r->version, r->nick, -1, false), CYR_RF_BASE);
-            send_now(r, p, cyr_ping(p, r->id, CYR_RF_CHAT, r->version, r->nick, -1, false), CYR_RF_CHAT);
-        }
-        for (int i = 0; i < r->nout;) {
-            if ((int32_t)(t - r->out[i].at) >= 0) {
-                send_now(r, r->out[i].pkt, r->out[i].len, r->out[i].channel);
-                r->out[i] = r->out[--r->nout];
-            } else {
-                i++;
-            }
-        }
+        tick(r, now_ms());
         pthread_mutex_unlock(&r->mu);
     }
     return NULL;
 }
+#endif
 
 relay_t *relay_create(const char *url, const char *room, const char *origin, uint32_t my_id, const char *nick,
                       const relay_host_t *host)
@@ -278,12 +324,15 @@ relay_t *relay_create(const char *url, const char *room, const char *origin, uin
     snprintf(r->origin, sizeof r->origin, "%s", origin ? origin : "");
     r->id = my_id;
     snprintf(r->nick, sizeof r->nick, "%s", nick);
-    RAND_bytes(&r->version, 1);
+    if (getentropy(&r->version, 1) || getentropy(&r->tab, sizeof r->tab)) { r->version = (uint8_t)time(NULL); r->tab = (uint32_t)time(NULL); }
     if (!r->version) r->version = 1;
-    RAND_bytes((unsigned char *)&r->tab, sizeof r->tab);
     r->host = *host;
     pthread_mutex_init(&r->mu, NULL);
+#ifdef __EMSCRIPTEN__
+    js_relay_open(r->url);
+#else
     if (pthread_create(&r->thread, NULL, run, r)) { free(r); return NULL; }
+#endif
     return r;
 }
 
@@ -291,16 +340,40 @@ void relay_destroy(relay_t *r)
 {
     if (!r) return;
     r->quit = 1;
+#ifdef __EMSCRIPTEN__
+    js_relay_close();
+#else
     pthread_join(r->thread, NULL);
     if (r->ws) ws_close(r->ws);
+#endif
     pthread_mutex_destroy(&r->mu);
     free(r);
 }
 
-bool relay_online(const relay_t *r) { return r && r->online; }
+bool relay_online(const relay_t *r)
+{
+#ifdef __EMSCRIPTEN__
+    return r && js_relay_online();
+#else
+    return r && r->online;
+#endif
+}
 
 void relay_poll(relay_t *r)
 {
+#ifdef __EMSCRIPTEN__
+    /* the page's WebSocket does the talking; the rest happens here */
+    static uint8_t f[9 + CYR_LONG + 64];
+    int fl;
+    int online = js_relay_online();
+    if (online && !r->online) { logf_r(r, "relay: joined %s", r->url); r->next_ping = now_ms(); }
+    r->online = online;
+    while ((fl = js_relay_next(f, sizeof f - 1)) != 0) {
+        if (fl == -2) logf_r(r, "relay says: %s", (const char *)f);
+        else frame_in(r, f, fl);
+    }
+    if (online) tick(r, now_ms());
+#endif
     heard_t got[IN_MAX];
     int n;
     unsigned lost;

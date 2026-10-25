@@ -19,29 +19,38 @@
 #include <poll.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/random.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "cymcp.h"
+#ifdef __EMSCRIPTEN__
+/* in a web page (web/): the page's USB and fetch */
+#include <emscripten.h>
+#include "net_web.h"
+cyusb_dev_t *cyusb_web_open(void);
+#else
 #include "cyusb_tcp.h"
+#endif
 #ifdef CYWIG_LIBUSB
 #include "cyusb_libusb.h"
 #endif
 #include "cy_gate.h"
+#ifndef __EMSCRIPTEN__
 #include "cyb_net_curl.h"
+#endif
 #include "../xtreme/proto.h"
 #include "cy_radio.h"
 #include "relay.h"
-#include <openssl/rand.h>
 
 #define RELAY_URL "https://cybiko-relay.sovgvd.workers.dev"
 #define RELAY_ORIGIN "https://sovgvd.github.io"   /* the web emulator's site */
 #define CHAT_TAG 0x8000                           /* UG_SEND tags of chat lines */
 
 #define PING_MS 3000
-#define APP_GONE_MS 8000
+#define APP_GONE_MS 15000
 #define START_TRIES 3
 #define APP_NAME "USBGate.app"
 
@@ -62,7 +71,9 @@ static void logf_(const char *fmt, ...)
     fputc('\n', stderr);
 }
 
+#ifndef __EMSCRIPTEN__
 static void on_signal(int s) { (void)s; stop = 1; }
+#endif
 
 typedef struct {
     cyusb_dev_t *dev;
@@ -210,6 +221,27 @@ static void relay_log(void *user, const char *line)
     logf_("%s", line);
 }
 
+static void set_chat(cywig_t *w, int on)
+{
+    w->chat_want = on;
+    if (on && !w->relay) logf_("chat: start with --chat to have the Internet side");
+    logf_("chat bridge: %s", on ? "on" : "off");
+    if (w->app_up) { uint8_t b = (uint8_t)on; send_rec(w, UG_CHAT, &b, 1); }
+}
+
+#ifdef __EMSCRIPTEN__
+/* The page's switch and stop button. They only leave word: the work is
+ * done in the loop (the page calls in while the loop waits for USB). */
+static volatile int chat_asked = -1;
+EMSCRIPTEN_KEEPALIVE void cywig_chat(int on) { chat_asked = on; }
+EMSCRIPTEN_KEEPALIVE void cywig_stop(void) { stop = 1; }
+static void read_stdin(cywig_t *w)
+{
+    if (chat_asked < 0) return;
+    set_chat(w, chat_asked);
+    chat_asked = -1;
+}
+#else
 /* "chat on" / "chat off" typed while it runs */
 static void read_stdin(cywig_t *w)
 {
@@ -225,10 +257,7 @@ static void read_stdin(cywig_t *w)
     while ((nl = strchr(b, '\n'))) {
         *nl = 0;
         if (!strcmp(b, "chat on") || !strcmp(b, "chat off")) {
-            w->chat_want = !strcmp(b, "chat on");
-            if (w->chat_want && !w->relay) logf_("chat: start with --chat to have the Internet side");
-            logf_("chat bridge: %s", w->chat_want ? "on" : "off");
-            if (w->app_up) { uint8_t on = (uint8_t)w->chat_want; send_rec(w, UG_CHAT, &on, 1); }
+            set_chat(w, !strcmp(b, "chat on"));
         } else if (*b) {
             logf_("type \"chat on\" or \"chat off\"");
         }
@@ -237,6 +266,7 @@ static void read_stdin(cywig_t *w)
     }
     if (bl == (int)sizeof b - 1) bl = 0;
 }
+#endif
 
 static void record(cywig_t *w, const uint8_t *r, int len)
 {
@@ -342,6 +372,18 @@ static int console(cywig_t *w, const char *line)
     return cymcp_write(w->link, CYMCP_CONSOLE_IN, line, (int)strlen(line) + 1, 5000) > 0;
 }
 
+/* The last sign of life from USB Gate: a HELLO, or any frame on its pipes
+ * (a busy Xtreme sends HELLOs late, but its pipes keep talking; starting
+ * a second USB Gate next to a slow one upsets CyOS). */
+static unsigned app_heard(cywig_t *w)
+{
+    unsigned h = w->hello_at;
+    unsigned a = cymcp_heard(w->link, 2 * UG_PIPE), b = cymcp_heard(w->link, 2 * UG_PIPE - 1);
+    if (a && (int)(a - h) > 0) h = a;
+    if (b && (int)(b - h) > 0) h = b;
+    return h;
+}
+
 static int run(cywig_t *w)
 {
     unsigned next_ping = 0, started_at = 0;
@@ -357,8 +399,8 @@ static int run(cywig_t *w)
         read_stdin(w);
         uint32_t wait = cy_gate_poll(w->gate, t);
         (void)wait;
-        if (w->app_up && (int)(t - w->hello_at) > APP_GONE_MS) {   /* signed: a HELLO can be newer than t */
-            logf_("USB Gate stopped answering");
+        if (w->app_up && (int)(t - app_heard(w)) > APP_GONE_MS) {   /* signed: a HELLO can be newer than t */
+            logf_("USB Gate stopped answering (nothing from it for %d s)", (int)(t - app_heard(w)) / 1000);
             w->app_up = 0;
             started_at = 0;
             starts = 0;
@@ -414,17 +456,22 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "-v")) verbose = 1;
         else { usage(argv[0]); return 2; }
     }
+    static cywig_t w;               /* static: a page keeps calling into it */
+    memset(&w, 0, sizeof w);
+    char err[256] = "";
+#ifdef __EMSCRIPTEN__
+    (void)emulator;
+    w.dev = cyusb_web_open();
+#else
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 #ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
 #endif
-
-    cywig_t w;
-    memset(&w, 0, sizeof w);
-    char err[256] = "";
     if (emulator) w.dev = cyusb_tcp_open(emulator, err, sizeof err);
-#ifdef CYWIG_LIBUSB
+#endif
+#ifdef __EMSCRIPTEN__
+#elif defined CYWIG_LIBUSB
     else w.dev = cyusb_libusb_open(err, sizeof err);
 #else
     else snprintf(err, sizeof err, "built without libusb: use --emulator");
@@ -435,7 +482,11 @@ int main(int argc, char **argv)
     w.link = cymcp_open(w.dev);
 
     cyb_net_t net;
+#ifdef __EMSCRIPTEN__
+    net_web_init(&net);
+#else
     cyb_net_curl(&net, NULL);
+#endif
     cy_gate_host_t host = { 0 };
     host.user = &w;
     host.log = gate_log;
@@ -456,7 +507,7 @@ int main(int argc, char **argv)
         /* the bridge's own seat in the room: an ID of its own (the 4c
          * prefix every Cybiko ID has, then random bits) */
         uint32_t id;
-        RAND_bytes((unsigned char *)&id, sizeof id);
+        if (getentropy(&id, sizeof id)) id = (uint32_t)time(NULL) * 2654435761u;
         id = 0x4c000000u | (id & 0xffffff);
         w.relay = relay_create(relay_url, room, RELAY_ORIGIN, id, nick, &rh);
         w.chat_want = 1;
@@ -473,9 +524,13 @@ int main(int argc, char **argv)
           (unsigned)k->frames_out, (unsigned)k->resent, (unsigned)k->bad, (unsigned)k->unexpected);
     cy_gate_destroy(w.gate);
     cymcp_close(w.link);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ if (Module.done) Module.done($0); }, r);
+#else
     if (emulator) cyusb_tcp_close(w.dev);
 #ifdef CYWIG_LIBUSB
     else cyusb_libusb_close(w.dev);
+#endif
 #endif
     return r;
 }

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cybiko USB Gate</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <h1>Cybiko USB Gate</h1>
+  <p class="lead">Turns a Cybiko Xtreme on its USB cable into an Internet gate (CyWIG) for the
+    Cybikos around it, right from this page: nothing to install. Pages for the WAP browser and
+    Browser.app, and, if you like, Chat with the people in the
+    <a href="https://sovgvd.github.io/cybiko-web-emulator/">web emulator</a>.</p>
+
+  <section id="nousb" class="warn" hidden>
+    This browser has no WebUSB. Use Chrome or Edge (on a computer, or on Android with a USB OTG
+    cable), or the <a href="https://github.com/SovGVD/cybiko-cywig">cywig</a> program.
+  </section>
+
+  <section class="card">
+    <h2>1. Put USB Gate on the Xtreme</h2>
+    <p>Copy <a href="USBGate.app" download>USBGate.app</a> to the Xtreme once (with EZ Loader, or any
+      way you put applications on it). This page starts it by itself.</p>
+  </section>
+
+  <section class="card">
+    <h2>2. Connect</h2>
+    <p>Plug the Xtreme in (CyOS on, not the boot screen) and press Connect.</p>
+    <div class="row">
+      <button id="connect">Connect the Xtreme</button>
+      <button id="stop" hidden>Stop</button>
+      <span id="state" class="state">Not connected</span>
+    </div>
+    <details>
+      <summary>Settings</summary>
+      <label><input type="checkbox" id="chat"> Bridge Chat to the Internet</label>
+      <label class="indent"><input type="checkbox" id="chatnow" disabled> Chat bridged now</label>
+      <label>Chat room <input id="room" value="public"></label>
+      <label>The bridge's name in the room <input id="nick" value="USBGate" maxlength="8"></label>
+      <label>WAP browser's Home page <input id="home" placeholder="the gate's own start page"></label>
+      <label>Proxy and relay <input id="proxy" value="https://cybiko-relay.sovgvd.workers.dev"></label>
+      <label><input type="checkbox" id="verbose"> Log every message</label>
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>If Connect doesn't show the Xtreme</h2>
+    <ul>
+      <li><b>Windows</b> needs the WinUSB driver for it once: run
+        <a href="https://zadig.akeo.ie/">Zadig</a>, pick "Cybiko" (USB ID 0B66 0041) and install WinUSB.</li>
+      <li><b>Linux</b>: allow your user to use it, e.g. a file
+        <code>/etc/udev/rules.d/50-cybiko.rules</code> with
+        <code>SUBSYSTEM=="usb", ATTR{idVendor}=="0b66", MODE="0666"</code>, then plug it in again.</li>
+      <li><b>Mac, ChromeOS, Android</b>: nothing to set up.</li>
+    </ul>
+    <p>Keep this tab open while it runs (it may be in the background).</p>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </section>
+
+  <footer>
+    Built on the work of Tim Schuerewegen (MAME's Cybiko driver) and the MAME team, Cybiko Inc.
+    (CyOS, CyWIG) and the Cybiko community. Source:
+    <a href="https://github.com/SovGVD/cybiko-cywig">cybiko-cywig</a>.
+  </footer>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

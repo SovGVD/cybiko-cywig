@@ -1,1 +1,4 @@
 build/
+web/site/cywig.js
+web/site/cywig.wasm
+web/site/USBGate.app
