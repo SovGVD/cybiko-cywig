@@ -1,0 +1,7 @@
+USB Gate
+
+Makes this Cybiko the Internet gate (CyWIG) for the Cybikos around it, with a PC on the USB cable fetching the pages (cybiko-cywig's PC tool).
+
+Start the PC tool, plug the cable in and leave this running. Other Cybikos then find the gate in their WAP browser and in Browser.
+
+Esc: stop the gate

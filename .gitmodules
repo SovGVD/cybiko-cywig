@@ -1,0 +1,3 @@
+[submodule "cybiko-browser"]
+	path = cybiko-browser
+	url = https://github.com/SovGVD/cybiko-browser
