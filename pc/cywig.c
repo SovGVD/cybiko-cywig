@@ -52,6 +52,8 @@ cyusb_dev_t *cyusb_web_open(void);
 #define PING_MS 3000
 #define APP_GONE_MS 15000
 #define START_TRIES 3
+#define START_WAIT_MS 20000   /* it starts, drops off the bus, comes back, and
+                                 the pipes take a few seconds to find step again */
 #define APP_NAME "USBGate.app"
 
 static volatile sig_atomic_t stop;
@@ -84,6 +86,10 @@ typedef struct {
     uint32_t xtreme_id;
     unsigned hello_at;            /* last UG_HELLO */
     int app_up;
+    /* starting USB Gate through the console; kept over a new link, since
+     * USB Gate drops the old one when it starts */
+    unsigned started_at;
+    int starts;
     /* records from the Xtreme */
     uint8_t rec[4 + UG_MAX];
     int rec_len;
@@ -276,8 +282,10 @@ static void record(cywig_t *w, const uint8_t *r, int len)
     case UG_HELLO:
         if (n < 6) break;
         if (!w->app_up || w->xtreme_id != get32(p + 2))
-            logf_("USB Gate running on Cybiko %08x (version %d, gate mode %s)", (unsigned)get32(p + 2), p[0],
-                  p[1] & UG_STATE_GATE ? "on" : "OFF");
+            logf_("USB Gate running on Cybiko %08x (version %d, gate mode %s, %s)", (unsigned)get32(p + 2), p[0],
+                  p[1] & UG_STATE_GATE ? "on" : "OFF",
+                  p[1] & UG_STATE_WINUSB ? "on USB as 0b66:0042, WinUSB for Windows"
+                                         : "on USB as 0b66:0041, its CyOS isn't one USB Gate knows");
         if (w->app_up && !!(p[1] & UG_STATE_CHAT) != w->chat_on)
             logf_("chat bridge %s on the Xtreme", p[1] & UG_STATE_CHAT ? "on" : "off");
         w->xtreme_id = get32(p + 2);
@@ -386,8 +394,7 @@ static unsigned app_heard(cywig_t *w)
 
 static int run(cywig_t *w)
 {
-    unsigned next_ping = 0, started_at = 0;
-    int starts = 0;
+    unsigned next_ping = 0;
     cymcp_listen(w->link, CYMCP_CONSOLE_OUT, 1);
     cymcp_listen(w->link, 2 * UG_PIPE, 1);
     while (!stop) {
@@ -402,26 +409,76 @@ static int run(cywig_t *w)
         if (w->app_up && (int)(t - app_heard(w)) > APP_GONE_MS) {   /* signed: a HELLO can be newer than t */
             logf_("USB Gate stopped answering (nothing from it for %d s)", (int)(t - app_heard(w)) / 1000);
             w->app_up = 0;
-            started_at = 0;
-            starts = 0;
+            w->started_at = 0;
+            w->starts = 0;
         }
         if (w->app_up && (int)(t - next_ping) >= 0) {
             next_ping = t + PING_MS;
             send_rec(w, UG_PING, NULL, 0);
         }
-        if (!w->app_up && (!started_at || (int)(t - started_at) > 6000)) {
-            if (starts++ >= START_TRIES) {
+        if (!w->app_up && (!w->started_at || (int)(t - w->started_at) > START_WAIT_MS)) {
+            if (w->starts++ >= START_TRIES) {
                 logf_("USB Gate does not start: is %s on the Xtreme?", APP_NAME);
-                starts = 0;
-                started_at = t + 30000;
+                w->starts = 0;
+                w->started_at = t + 30000;
                 continue;
             }
             console(w, APP_NAME);
-            started_at = t;
+            w->started_at = t;
         }
     }
     if (w->app_up) send_rec(w, UG_QUIT, NULL, 0);
     return 0;
+}
+
+/* The Xtreme on the cable (or the emulator's). USB Gate takes it off the
+ * bus for a moment when it starts and when it stops (it comes back under
+ * another USB ID, see xtreme/main.c), so this is also how the device is
+ * found again: keep trying until it is there or we're told to stop. */
+static cyusb_dev_t *open_xtreme(const char *emulator, int quiet)
+{
+    char err[256] = "";
+    unsigned tries = 0;
+    for (;;) {
+        cyusb_dev_t *d = NULL;
+#ifdef __EMSCRIPTEN__
+        (void)emulator;
+        d = cyusb_web_open();
+        if (!d) snprintf(err, sizeof err, "the page stopped");
+#else
+        if (emulator) d = cyusb_tcp_open(emulator, err, sizeof err);
+#ifdef CYWIG_LIBUSB
+        else d = cyusb_libusb_open(err, sizeof err);
+#else
+        else snprintf(err, sizeof err, "built without libusb: use --emulator");
+#endif
+#endif
+        if (d || stop) return d;
+#if !defined __EMSCRIPTEN__ && !defined CYWIG_LIBUSB
+        if (!emulator) { logf_("%s", err); return NULL; }
+#endif
+        if (!quiet && tries == 0) logf_("%s; waiting for it (Ctrl-C to give up)", err);
+        if (quiet && tries == 50) logf_("the Xtreme isn't back yet: %s; still waiting", err);
+        tries++;
+#ifdef __EMSCRIPTEN__
+        emscripten_sleep(200);
+#else
+        usleep(200000);
+#endif
+    }
+}
+
+static void close_xtreme(cyusb_dev_t *d, const char *emulator)
+{
+#ifdef __EMSCRIPTEN__
+    (void)d;
+    (void)emulator;
+#else
+    if (emulator) cyusb_tcp_close(d);
+#ifdef CYWIG_LIBUSB
+    else cyusb_libusb_close(d);
+#endif
+#endif
 }
 
 static void usage(const char *me)
@@ -458,27 +515,21 @@ int main(int argc, char **argv)
     }
     static cywig_t w;               /* static: a page keeps calling into it */
     memset(&w, 0, sizeof w);
-    char err[256] = "";
-#ifdef __EMSCRIPTEN__
-    (void)emulator;
-    w.dev = cyusb_web_open();
-#else
+#ifndef __EMSCRIPTEN__
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 #ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
 #endif
-    if (emulator) w.dev = cyusb_tcp_open(emulator, err, sizeof err);
 #endif
+    w.dev = open_xtreme(emulator, 0);
+    if (!w.dev) {
 #ifdef __EMSCRIPTEN__
-#elif defined CYWIG_LIBUSB
-    else w.dev = cyusb_libusb_open(err, sizeof err);
-#else
-    else snprintf(err, sizeof err, "built without libusb: use --emulator");
+        EM_ASM({ if (Module.done) Module.done(1); });
 #endif
-    if (!w.dev) { logf_("%s", err); return 1; }
-    logf_("Xtreme on the cable%s%s", emulator ? " (emulated at " : "", emulator ? emulator : "");
-    if (emulator) fprintf(stderr, ")\n");
+        return 1;
+    }
+    logf_("Xtreme on the cable%s%s%s", emulator ? " (emulated at " : "", emulator ? emulator : "", emulator ? ")" : "");
     w.link = cymcp_open(w.dev);
 
     cyb_net_t net;
@@ -514,7 +565,28 @@ int main(int argc, char **argv)
         logf_("chat bridge on: room %s of %s", room, relay_url);
     }
 
-    int r = run(&w);
+    int r;
+    /* run until stopped; when the Xtreme drops off the bus (USB Gate does
+     * that when it starts, to come back as 0042), find it again */
+    while ((r = run(&w)) != 0 && !stop) {
+        cymcp_close(w.link);
+        close_xtreme(w.dev, emulator);
+        w.link = NULL;
+        w.con_len = 0;
+        logf_("looking for the Xtreme again");
+        w.dev = open_xtreme(emulator, 1);
+        if (!w.dev) break;
+        logf_("Xtreme back on the cable");
+        w.link = cymcp_open(w.dev);
+    }
+    if (!w.link) {
+        cy_gate_destroy(w.gate);
+        if (w.relay) relay_destroy(w.relay);
+#ifdef __EMSCRIPTEN__
+        EM_ASM({ if (Module.done) Module.done(0); });
+#endif
+        return stop ? 0 : 1;
+    }
     if (w.relay) {
         logf_("chat: %u lines to the Internet, %u from it", w.lines_out, w.lines_in);
         relay_destroy(w.relay);
@@ -524,13 +596,9 @@ int main(int argc, char **argv)
           (unsigned)k->frames_out, (unsigned)k->resent, (unsigned)k->bad, (unsigned)k->unexpected);
     cy_gate_destroy(w.gate);
     cymcp_close(w.link);
+    close_xtreme(w.dev, emulator);
 #ifdef __EMSCRIPTEN__
     EM_ASM({ if (Module.done) Module.done($0); }, r);
-#else
-    if (emulator) cyusb_tcp_close(w.dev);
-#ifdef CYWIG_LIBUSB
-    else cyusb_libusb_close(w.dev);
-#endif
 #endif
     return r;
 }

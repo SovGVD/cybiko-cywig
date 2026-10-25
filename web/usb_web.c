@@ -43,4 +43,8 @@ static unsigned now_ms(cyusb_dev_t *d) { (void)d; return (unsigned)emscripten_ge
 
 static cyusb_dev_t dev = { control, bulk, log_, now_ms, NULL };
 
-cyusb_dev_t *cyusb_web_open(void) { return &dev; }
+/* The page's cable (Module.usb.open): waits until there is one, again
+ * after the Xtreme left the bus; 0 when the page is stopping the gate. */
+EM_ASYNC_JS(int, js_usb_open, (void), { return (await Module.usb.open()) ? 1 : 0; });
+
+cyusb_dev_t *cyusb_web_open(void) { return js_usb_open() ? &dev : NULL; }

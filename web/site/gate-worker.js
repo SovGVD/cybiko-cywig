@@ -4,7 +4,10 @@
  *
  * Module.usb: the cable, as WebUSB or, for trying it without an Xtreme, a
  * WebSocket to Dragonfruit's emulator (cybiko_host --usb-server, through
- * web/dev-bridge.mjs). Module.net: fetches through the proxy (the web
+ * web/dev-bridge.mjs). USB Gate takes the Xtreme off the bus for a moment
+ * when it starts and stops, and it comes back as another USB device
+ * (0B66:0042, which Windows gives WinUSB by itself), so the cable is
+ * opened again (cable.open) whenever the gate finds the old one gone. Module.net: fetches through the proxy (the web
  * emulator's Cloudflare Worker). Module.relay: the chat room's WebSocket. */
 
 let settings = {};
@@ -15,6 +18,22 @@ function timeout(ms) {
 }
 
 /* ---- the cable over WebUSB ---- */
+
+/* USB Gate running first: it's the one Windows can open */
+const XTREME = [0x0042, 0x0041];
+
+async function openWebusb() {
+    const devs = (await navigator.usb.getDevices()).filter(d => d.vendorId === 0x0b66 && XTREME.includes(d.productId));
+    devs.sort((a, b) => XTREME.indexOf(a.productId) - XTREME.indexOf(b.productId));
+    if (!devs.length) return null;
+    const dev = devs[0];
+    await dev.open();
+    if (!dev.configuration) await dev.selectConfiguration(1);
+    await dev.claimInterface(0);
+    log(`usb: ${dev.productName || "Cybiko"} by ${dev.manufacturerName || "?"}, ` +
+        `0b66:${dev.productId.toString(16).padStart(4, "0")}${dev.productId === 0x0042 ? " (USB Gate running)" : ""}`);
+    return webusb(dev);
+}
 
 function webusb(dev) {
     const pendingIn = {};          /* endpoint -> a transferIn that hasn't come back yet */
@@ -119,6 +138,40 @@ function emulated(url) {
             return { result: r, timedOut: !!h[4], data };
         }),
     };
+}
+
+/* ---- the cable, whichever it is, found again when it goes ---- */
+const cable = {
+    t: null, fresh: false, stopping: false, asked: false,
+    async start() {
+        this.t = settings.emulator ? await openEmulated() : await openWebusb();
+        if (!this.t) throw new Error("the Xtreme isn't there (plugged out, or CyOS not running?)");
+        this.fresh = true;
+    },
+    /* for the gate (usb_web.c): true once there is a cable, false when stopping */
+    async open() {
+        if (this.fresh) { this.fresh = false; return true; }
+        this.t = null;
+        for (let i = 0; !this.stopping; i++) {
+            try { this.t = settings.emulator ? await openEmulated() : await openWebusb(); }
+            catch (e) { if (i % 20 === 0) log(`usb: ${e.message}`); }
+            if (this.t) { postMessage({ t: "found" }); return true; }
+            /* a USB device the page hasn't been allowed to use yet (0042
+             * the first time): only a click on the page can allow it */
+            if (!settings.emulator && i === 6 && !this.asked) { this.asked = true; postMessage({ t: "pick" }); }
+            await timeout(500);
+        }
+        return false;
+    },
+    control(...a) { return this.t ? this.t.control(...a) : Promise.resolve({ result: -3 }); },
+    bulk(...a) { return this.t ? this.t.bulk(...a) : Promise.resolve({ result: -3 }); },
+};
+
+async function openEmulated() {
+    const u = emulated(settings.emulator);
+    await u.opened;
+    log(`usb: emulated Xtreme at ${settings.emulator}`);
+    return u;
 }
 
 /* ---- the gate's network: one hop at a time through the proxy ----
@@ -229,29 +282,15 @@ onmessage = async e => {
     const m = e.data;
     if (m.t === "start") {
         settings = m.settings;
-        let usb;
         try {
-            if (settings.emulator) {
-                usb = emulated(settings.emulator);
-                await usb.opened;
-                log(`usb: emulated Xtreme at ${settings.emulator}`);
-            } else {
-                const devs = await navigator.usb.getDevices();
-                const dev = devs.find(d => d.vendorId === 0x0b66 && d.productId === 0x0041);
-                if (!dev) throw new Error("the Xtreme isn't there (plugged out, or CyOS not running?)");
-                await dev.open();
-                if (!dev.configuration) await dev.selectConfiguration(1);
-                await dev.claimInterface(0);
-                usb = webusb(dev);
-                log(`usb: ${dev.productName || "Cybiko"} by ${dev.manufacturerName || "?"}`);
-            }
+            await cable.start();
         } catch (err) {
             log(`usb: ${err.message}`);
             postMessage({ t: "stopped", why: err.message });
             return;
         }
         M = await CywigModule({
-            usb, net, relay,
+            usb: cable, net, relay,
             log,
             done: r => postMessage({ t: "stopped", why: r ? "the gate stopped (see the log)" : "" }),
             print: log,
@@ -266,6 +305,7 @@ onmessage = async e => {
     } else if (m.t === "chat" && M) {
         M._cywig_chat(m.on ? 1 : 0);
     } else if (m.t === "stop" && M) {
+        cable.stopping = true;
         M._cywig_stop();
     }
 };

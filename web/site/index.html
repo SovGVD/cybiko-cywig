@@ -22,14 +22,18 @@
   <section class="card">
     <h2>1. Put USB Gate on the Xtreme</h2>
     <p>Copy <a href="USBGate.app" download>USBGate.app</a> to the Xtreme once (with EZ Loader, or any
-      way you put applications on it). This page starts it by itself.</p>
+      way you put applications on it). This page starts it by itself (but on Windows, start it on
+      the Xtreme yourself). When it starts, the Xtreme leaves USB for a moment and comes back as
+      "USB Gate": the first time, the page asks you to pick it again.</p>
   </section>
 
   <section class="card">
     <h2>2. Connect</h2>
-    <p>Plug the Xtreme in (CyOS on, not the boot screen) and press Connect.</p>
+    <p>Plug the Xtreme in (CyOS on, not the boot screen) and press Connect. On Windows, start
+      USB Gate on the Xtreme first (Windows sets it up by itself then, see below).</p>
     <div class="row">
       <button id="connect">Connect the Xtreme</button>
+      <button id="repick" hidden>Pick it again</button>
       <button id="stop" hidden>Stop</button>
       <span id="state" class="state">Not connected</span>
     </div>
@@ -48,8 +52,12 @@
   <section class="card">
     <h2>If Connect doesn't show the Xtreme</h2>
     <ul>
-      <li><b>Windows</b> needs the WinUSB driver for it once: run
-        <a href="https://zadig.akeo.ie/">Zadig</a>, pick "Cybiko" (USB ID 0B66 0041) and install WinUSB.</li>
+      <li><b>Windows</b> (8 or newer) opens it only while USB Gate runs: start USB Gate on the
+        Xtreme by hand, wait a few seconds while Windows sets it up (the first time), then press
+        Connect and pick the Cybiko. USB Gate shows up as its own USB device (0B66 0042) that asks
+        Windows for the WinUSB driver itself, so there's no driver to install. (The Xtreme without
+        USB Gate, 0B66 0041, still needs <a href="https://zadig.akeo.ie/">Zadig</a>; that's only
+        needed to have this page start USB Gate for you.)</li>
       <li><b>Linux</b>: allow your user to use it, e.g. a file
         <code>/etc/udev/rules.d/50-cybiko.rules</code> with
         <code>SUBSYSTEM=="usb", ATTR{idVendor}=="0b66", MODE="0666"</code>, then plug it in again.</li>

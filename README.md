@@ -67,11 +67,22 @@ Settings; fetching and Chat go through the web emulator's Cloudflare Worker.
 It needs a browser with WebUSB: Chrome, Edge or another Chromium, on a
 computer or on Android with an OTG cable (not Firefox or Safari).
 
-- **Windows**: WebUSB can only open a device that has the WinUSB driver.
-  Install it once with [Zadig](https://zadig.akeo.ie/): Options -> List All
-  Devices, pick the Cybiko (USB ID `0B66 0041`), choose WinUSB, Install
-  Driver. (EZ Loader uses its own driver, so to use EZ Loader again, put that
-  one back in Device Manager.)
+When USB Gate starts, the Xtreme leaves USB for half a second and comes
+back as `0B66 0042` (and as `0041` again when it stops). The page and
+cywig find it again by themselves; the first time, the browser needs a
+click to allow the new device, so the page shows **Pick it again**.
+
+- **Windows** (8 or newer): start USB Gate on the Xtreme by hand, give
+  Windows a few seconds the first time, then press Connect and pick the
+  Cybiko. While USB Gate runs, the Xtreme is a USB device of its own
+  (`0B66 0042`) that asks Windows for the WinUSB driver itself (Microsoft OS
+  descriptors), so there is nothing to install; see
+  [WinUSB without Zadig](#winusb-without-zadig). Without USB Gate the Xtreme
+  is `0B66 0041`, which Windows only opens after installing WinUSB with
+  [Zadig](https://zadig.akeo.ie/) (Options -> List All Devices, the Cybiko,
+  WinUSB, Install Driver); that is only needed for the page to start USB Gate
+  itself. EZ Loader's own driver stays on `0041`, so EZ Loader keeps
+  working.
 - **Linux**: allow your user to open it, e.g. `/etc/udev/rules.d/50-cybiko.rules`
   with `SUBSYSTEM=="usb", ATTR{idVendor}=="0b66", MODE="0666"`, then plug it in again.
 - **macOS, ChromeOS, Android**: nothing to set up.
@@ -99,6 +110,35 @@ exports and two kernel structures directly):
 The USB protocol and the CyOS exports used here are described in
 [cybiko-docs](https://github.com/SovGVD/cybiko-docs) `usb.md`.
 
+## WinUSB without Zadig
+
+Windows binds a driver by itself to a vendor class device only when the
+device asks for one with Microsoft OS 1.0 descriptors ("WCID"). CyOS 1.5.08
+has none, so while it runs USB Gate adds them, in RAM only:
+
+- It puts a hook in CyOS's USB control request handler (kernel code in RAM
+  at 4accb2) that answers string descriptor `ee` (`MSFT100`, vendor request
+  `47`), the compatible ID request (`WINUSB`) and the extended properties
+  request (`DeviceInterfaceGUID` =
+  `{A81E3782-6DF8-4A47-8F65-692FACB7C0DB}`), and passes every other request
+  to CyOS.
+- It changes CyOS's device descriptor to USB 2.0 (Windows only asks USB 2.0
+  devices; still full speed, and the hook stalls the high speed descriptor
+  requests as a full speed USB 2.0 device must) and product ID `0042`.
+  Windows remembers per USB ID whether a device has the descriptors, and a
+  driver installed for `0041` (EZ Loader's, or Zadig's) would win anyway.
+- It drops off the bus for 400 ms (USBN9604 MCNTRL.NAT) so the PC reads the
+  new descriptors, and on the way out puts everything back and does it
+  again. A restart of the Xtreme undoes it as well.
+- It checks the kernel's bytes first; on another CyOS it does none of this
+  (cywig then logs that the Xtreme stayed `0041`).
+
+On a PC that never saw `0B66 0042`, Windows reads the descriptors once and
+installs WinUSB from its own driver store. Linux and macOS don't care, and
+cywig and the page open either ID. Verified only in Dragonfruit's emulator,
+whose USB host enumerates like Windows and logs the descriptors (the
+`--usb` script step `reenum` waits for a drop-off and enumerates again).
+
 ## Credits
 
 - `pc/cy_radio` is Dragonfruit's radio protocol library; the protocol was
@@ -108,5 +148,8 @@ The USB protocol and the CyOS exports used here are described in
   build on.
 - The MAME team, for the H8S and Cybiko emulation the work started from.
 - Cybiko Inc., for CyOS, the CyWIG and the original VCyWIG.
+- Pete Batard (libwdi, Zadig): the
+  [WCID devices](https://github.com/pbatard/libwdi/wiki/WCID-Devices) notes the
+  WinUSB descriptors follow.
 - The Cybiko community, for keeping the ROM and flash dumps, SDKs and CDs
   available.

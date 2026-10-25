@@ -10,7 +10,11 @@
  * change to CyOS or its flash: this is an ordinary application.
  *
  * Two threads: this application's own (screen, keys, the port's messages,
- * sending to the PC) and a reader that waits on the pipe for the PC. */
+ * sending to the PC) and a reader that waits on the pipe for the PC.
+ *
+ * While it runs, the Xtreme also tells Windows to give it the WinUSB
+ * driver by itself (no Zadig): it shows up under a USB ID of its own and
+ * answers the Microsoft OS descriptor requests, see "WinUSB" below. */
 #include "../cybiko-browser/cyapp/cyos.h"
 #include "proto.h"
 
@@ -38,6 +42,7 @@ extern void *cy_rf;                       /* the radio's channel object */
 void cy_rf_set_channel(void *rf, u8 channel);
 u8 cy_rf_channel(void *rf);
 struct Message *cy_Queue_peek_message(struct Queue *q, int remove, int min, int max);
+u32 cy_clock(void);                       /* CyOS's clock, 0.1 ms */
 
 /* an IPipe's methods (CyOS's console and loader call them this way) */
 #define PIPE_VT(p) (*(void ***)((char *)(p) + 8))
@@ -86,6 +91,232 @@ static u8 dirty = 1;
 static struct DisplayGraphics *gfx;
 
 static u8 tx[4 + 20 + UG_MAX];
+
+/* ---- WinUSB without Zadig ----
+ *
+ * Windows only loads a driver by itself for a vendor class device when
+ * the device asks for one with Microsoft OS descriptors (1.0, "WCID"):
+ * string descriptor ee says "MSFT100" and a vendor request code, and that
+ * request (wIndex 4) names the compatible ID "WINUSB". CyOS answers
+ * neither: its control handler (CyOS 1.5.08, in RAM) gives an empty answer
+ * to every vendor request and takes a string index as an offset into its
+ * table. So while USB Gate runs it puts a hook in front of the handler's
+ * check for standard requests (4accb2) that answers these three requests
+ * the way the handler answers GET_DESCRIPTOR (first 8 bytes into the
+ * FIFO, the rest from the state at +10/+14/+16 on the next INs), and
+ * passes everything else on. Windows remembers per USB ID (and release)
+ * whether a device has the descriptors, and EZ Loader's driver or a
+ * driver put in with Zadig is bound to 0B66:0041 already, so the Xtreme
+ * also changes the product ID in CyOS's device descriptor to UG_USB_PID
+ * and drops off the bus for a moment (MCNTRL.NAT), so the PC enumerates it
+ * again. Windows only asks USB 2.0 devices for the descriptors, so the
+ * descriptor also says USB 2.0 (still full speed); a USB 2.0 device that
+ * can't do high speed answers the requests for its other-speed
+ * descriptors (06, 07) with a STALL, which the hook does too and lifts at
+ * the next SETUP (the USBN9604 doesn't, and CyOS never stalls). On the way out all of it is put back. CyOS's flash isn't
+ * touched: it's all in RAM, and a restart undoes it too. Nothing is done
+ * when the kernel's bytes aren't the expected ones (another CyOS). */
+#define USBN_ADDR (*(volatile u8 *)0x200003)
+#define USBN_DATA (*(volatile u8 *)0x200000)
+#define MCNTRL_NAT 0x08
+#define EPC0_STALL 0x80
+#define K_DEV_DESC ((u8 *)0x4838c2)      /* CyOS's device descriptor */
+#define K_SETUP_CHECK ((u8 *)0x4accb2)   /* "standard request?" in the EP0 handler */
+#define K_STANDARD 0x4accbaUL            /* ... yes: the bRequest switch */
+#define K_SETUP_END 0x4acd56UL           /* ... no: send what's in the FIFO */
+#define MS_VENDOR 0x47                   /* our vendor request for the descriptors */
+
+static const u8 k_setup_check[8] = { 0x68, 0x6a, 0xea, 0x60, 0x58, 0x60, 0x00, 0x9c };
+static const u8 k_dev_desc[12] = { 0x12, 0x01, 0x10, 0x01, 0xff, 0xff, 0xff, 0x08, 0x66, 0x0b, 0x41, 0x00 };
+static const u8 our_dev_desc[12] = { 0x12, 0x01, 0x00, 0x02, 0xff, 0xff, 0xff, 0x08, 0x66, 0x0b,
+                                     (u8)UG_USB_PID, (u8)(UG_USB_PID >> 8) };
+
+static const u8 ms_os_string[18] = {
+    18, 3, 'M', 0, 'S', 0, 'F', 0, 'T', 0, '1', 0, '0', 0, '0', 0, MS_VENDOR, 0
+};
+static const u8 ms_compat_id[40] = {
+    40, 0, 0, 0, 0x00, 0x01, 0x04, 0x00, 1, 0, 0, 0, 0, 0, 0, 0,
+    0, 1, 'W', 'I', 'N', 'U', 'S', 'B', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+};
+/* DeviceInterfaceGUID (one interface: the REG_SZ form, as libwdi
+ * advises), for programs that look WinUSB devices up by interface */
+#define PROPS_LEN (10 + 132)
+static u8 ms_props[PROPS_LEN];
+static const char props_name[] = "DeviceInterfaceGUID";
+static const char props_guid[] = UG_USB_GUID;
+
+static u8 tramp[28];                     /* the hook's code (filled in at run time) */
+static u8 wcid_on;
+static volatile u8 ep0_stalled;
+
+static u8 irq_off(void)
+{
+    u8 c;
+    __asm__ __volatile__("stc ccr,%0l\n\torc #0x80,ccr" : "=r"(c));
+    return c;
+}
+
+static void irq_restore(u8 c)
+{
+    __asm__ __volatile__("ldc %0l,ccr" : : "r"(c));
+}
+
+static u8 usbn_get(u8 reg)
+{
+    u8 c = irq_off(), v;
+    USBN_ADDR = reg;
+    v = USBN_DATA;
+    irq_restore(c);
+    return v;
+}
+
+static void usbn_set(u8 reg, u8 v)
+{
+    u8 c = irq_off();
+    USBN_ADDR = reg;
+    USBN_DATA = v;
+    irq_restore(c);
+}
+
+/* Called from CyOS's USB interrupt with its control state (the SETUP
+ * packet at +6). 1: answered here. */
+static u8 ms_setup(u8 *st)
+{
+    const u8 *s = st + 6, *d;
+    u16 n, len = (u16)(s[6] | s[7] << 8), i;
+    if (ep0_stalled) {                   /* a new SETUP ends the stall */
+        USBN_ADDR = 0x20;                /* EPC0 */
+        n = USBN_DATA;
+        USBN_ADDR = 0x20;
+        USBN_DATA = (u8)(n & ~EPC0_STALL);
+        ep0_stalled = 0;
+    }
+    if (s[0] == 0x80 && s[1] == 6 && (s[3] == 6 || s[3] == 7)) {
+        USBN_ADDR = 0x20;                /* no high speed: STALL */
+        n = USBN_DATA;
+        USBN_ADDR = 0x20;
+        USBN_DATA = (u8)(n | EPC0_STALL);
+        ep0_stalled = 1;
+        st[0x0f] = 0;
+        return 1;
+    }
+    if (s[0] == 0x80 && s[1] == 6 && s[3] == 3 && s[2] == 0xee) { d = ms_os_string; n = sizeof ms_os_string; }
+    else if ((s[0] == 0xc0 || s[0] == 0xc1) && s[1] == MS_VENDOR && s[5] == 0 && s[4] == 4) { d = ms_compat_id; n = sizeof ms_compat_id; }
+    else if ((s[0] == 0xc0 || s[0] == 0xc1) && s[1] == MS_VENDOR && s[5] == 0 && s[4] == 5) { d = ms_props; n = sizeof ms_props; }
+    else return 0;
+    if (n > len) n = len;
+    st[0x0f] = 1;                        /* sending a descriptor */
+    *(const u8 **)(st + 0x10) = d;
+    *(u16 *)(st + 0x16) = n;
+    for (i = 0; i < n && i < 8; i++) {   /* interrupts are off in here */
+        USBN_ADDR = 0x21;                /* TXD0 */
+        USBN_DATA = d[i];
+    }
+    *(u16 *)(st + 0x14) = i;
+    return 1;
+}
+
+static void put_le32(u8 *p, u32 v) { p[0] = (u8)v; p[1] = (u8)(v >> 8); p[2] = (u8)(v >> 16); p[3] = (u8)(v >> 24); }
+
+static void make_props(void)
+{
+    u8 *p = ms_props;
+    int i;
+    put_le32(p, PROPS_LEN);
+    p[4] = 0; p[5] = 1;                  /* version 1.00 */
+    p[6] = 5; p[7] = 0;                  /* wIndex 5 */
+    p[8] = 1; p[9] = 0;                  /* one property */
+    p += 10;
+    put_le32(p, 132);
+    put_le32(p + 4, 1);                  /* REG_SZ */
+    p[8] = 40; p[9] = 0;
+    for (i = 0; i < 20; i++) { p[10 + 2 * i] = (u8)props_name[i]; p[11 + 2 * i] = 0; }
+    put_le32(p + 50, 78);
+    for (i = 0; i < 39; i++) { p[54 + 2 * i] = (u8)props_guid[i]; p[55 + 2 * i] = 0; }
+}
+
+static u8 same(const u8 *a, const u8 *b, int n)
+{
+    while (n--) if (*a++ != *b++) return 0;
+    return 1;
+}
+
+static void memcpy_(u8 *d, const u8 *s, int n)
+{
+    while (n--) *d++ = *s++;
+}
+
+static void put24(u8 *p, u32 a) { p[0] = (u8)(a >> 16); p[1] = (u8)(a >> 8); p[2] = (u8)a; }
+
+/* Waits ms on CyOS's clock, asking the application's queue only for a
+ * message nobody sends (the keys and the rest stay there; CyOS may not
+ * wait out the timeout with others queued, so the clock decides). */
+static void pause_app(long ms)
+{
+    u32 t0 = cy_clock();
+    while ((long)(cy_clock() - t0) < ms * 10) {
+        struct Message *m = cy_Queue_get_message(PROCESS_QUEUE(me), 20, 0x7ffe, 0x7ffe);
+        if (m) cy_Message_delete(m);
+    }
+}
+
+/* Off the bus and back, so the PC reads the descriptors again. */
+static void usb_replug(void)
+{
+    u8 m = usbn_get(0);
+    if (!(m & MCNTRL_NAT)) return;       /* not attached: it'll see them next time */
+    usbn_set(0, (u8)(m & ~MCNTRL_NAT));
+    pause_app(400);
+    usbn_set(0, m);
+}
+
+static void wcid_start(void)
+{
+    static const u8 code[28] = {
+        0x0f, 0xe0,                      /* mov.l er6,er0 */
+        0x1b, 0x90, 0x1b, 0x80,          /* subs #4,er0; subs #2,er0: the state */
+        0x5e, 0, 0, 0,                   /* jsr @ms_setup */
+        0x0c, 0x88,                      /* mov.b r0l,r0l */
+        0x46, 0x0a,                      /* bne end */
+        0x68, 0x6a, 0xea, 0x60,          /* what the hook replaced: */
+        0x46, 0x04,                      /* standard request? no: end */
+        0x5a, 0, 0, 0,                   /* jmp @K_STANDARD */
+        0x5a, 0, 0, 0,                   /* end: jmp @K_SETUP_END */
+    };
+    u8 c;
+    if (!same(K_SETUP_CHECK, k_setup_check, 8) || !same(K_DEV_DESC, k_dev_desc, 12)) return;
+    make_props();
+    memcpy_(tramp, code, sizeof code);
+    put24(tramp + 7, (u32)ms_setup);
+    put24(tramp + 21, K_STANDARD);
+    put24(tramp + 25, K_SETUP_END);
+    c = irq_off();
+    K_SETUP_CHECK[0] = 0x5a;             /* jmp @tramp */
+    put24(K_SETUP_CHECK + 1, (u32)tramp);
+    memcpy_(K_DEV_DESC, our_dev_desc, 12);
+    irq_restore(c);
+    wcid_on = 1;
+    usb_replug();
+}
+
+static void wcid_stop(void)
+{
+    u8 c;
+    if (!wcid_on) return;
+    c = irq_off();
+    memcpy_(K_SETUP_CHECK, k_setup_check, 4);
+    memcpy_(K_DEV_DESC, k_dev_desc, 12);
+    if (ep0_stalled) {
+        USBN_ADDR = 0x20;
+        ep0_stalled = USBN_DATA;
+        USBN_ADDR = 0x20;
+        USBN_DATA = (u8)(ep0_stalled & ~EPC0_STALL);
+        ep0_stalled = 0;
+    }
+    irq_restore(c);
+    wcid_on = 0;
+    usb_replug();
+}
 static u8 rx[UG_MAX + 4];
 
 static void put16(u8 *p, u16 v) { p[0] = (u8)(v >> 8); p[1] = (u8)v; }
@@ -109,7 +340,7 @@ static void hello(void)
     const char *name = "USB Gate";
     int n = 0;
     tx[4] = UG_VERSION;
-    tx[5] = (cy_get_gate_mode() ? UG_STATE_GATE : 0) | (chat ? UG_STATE_CHAT : 0);
+    tx[5] = (cy_get_gate_mode() ? UG_STATE_GATE : 0) | (chat ? UG_STATE_CHAT : 0) | (wcid_on ? UG_STATE_WINUSB : 0);
     put32(tx + 6, (u32)cy_get_own_id());
     while (name[n]) { tx[10 + n] = (u8)name[n]; n++; }
     send_rec(UG_HELLO, 6 + n);
@@ -297,7 +528,7 @@ static void paint(void)
     cy_sprintf(s, "Answers %ld, failed %ld", answers, failed);
     line(62, s);
     cy_Graphics_set_font(gfx, cy_mini_normal_font);
-    line(90, "Esc: stop the gate");
+    line(90, wcid_on ? "Esc: stop    USB: ready for Windows" : "Esc: stop the gate");
     cy_DisplayGraphics_show(gfx);
     dirty = 0;
 }
@@ -375,6 +606,8 @@ static void run(struct Process *p)
         cy_Thread_start(rd, 0);
     }
     paint();
+    wcid_start();
+    paint();
     while (!quitting) {
         struct Message *m = cy_Queue_get_message(PROCESS_QUEUE(p), 50, 0, 0x7fff);
         now_ms += 50;                   /* close enough for the screen */
@@ -424,6 +657,7 @@ static void run(struct Process *p)
         if (dirty) paint();
     }
     cy_set_gate_mode(0);
+    wcid_stop();
     /* the reader stops at its next read (at most 2 s) */
     for (i = 0; i < 60 && rd && !rd_done; i++) {
         struct Message *m = cy_Queue_get_message(PROCESS_QUEUE(p), 50, 0, 0x7fff);

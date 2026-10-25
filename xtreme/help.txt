@@ -4,4 +4,6 @@ Makes this Cybiko the Internet gate (CyWIG) for the Cybikos around it, with a PC
 
 Start the PC tool, plug the cable in and leave this running. Other Cybikos then find the gate in their WAP browser and in Browser.
 
+While it runs, this Cybiko is a USB device of its own (0B66 0042) that Windows sets up by itself, so no driver needs installing. It leaves USB for a moment when it starts and stops.
+
 Esc: stop the gate

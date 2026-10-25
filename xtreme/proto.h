@@ -7,7 +7,8 @@
  * Numbers are big-endian, like everything on a Cybiko.
  *
  * From the Xtreme:
- *   UG_HELLO   version, state (bit 0: gate mode on, bit 1: chat bridged),
+ *   UG_HELLO   version, state (bit 0: gate mode on, bit 1: chat bridged,
+ *              bit 2: on the bus as UG_USB_PID with WinUSB descriptors),
  *              own Cybiko ID (4), CyOS's name for itself ("USB Gate")
  *   UG_MSG     a message for the gate: sender ID (4), msg id (2), p0 (4),
  *              p1 (4), port it came to (2), its data
@@ -43,6 +44,15 @@
 
 #define UG_STATE_GATE 0x01
 #define UG_STATE_CHAT 0x02
+#define UG_STATE_WINUSB 0x04
+
+/* While USB Gate runs, the Xtreme is on the bus as 0B66:UG_USB_PID
+ * (CyOS alone is 0B66:0041) and tells Windows to give it WinUSB, with
+ * this device interface GUID. */
+#define UG_USB_VID   0x0b66
+#define UG_USB_PID   0x0042
+#define UG_USB_GUID  "{A81E3782-6DF8-4A47-8F65-692FACB7C0DB}"
+
 
 /* Message_check_delivery */
 #define UG_DL_NONE    0

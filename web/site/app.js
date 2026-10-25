@@ -40,22 +40,30 @@ function settings() {
 
 function running(on) {
     $("connect").hidden = on;
+    if (!on) $("repick").hidden = true;
     $("stop").hidden = !on;
     for (const f of FIELDS) $(f).disabled = on;
     $("chatnow").disabled = !on || !$("chat").checked;
     $("chatnow").checked = on && $("chat").checked;
 }
 
+/* CyOS (0041) and CyOS with USB Gate running (0042, the one Windows
+ * opens without Zadig) are two USB devices to the browser */
+const XTREME = [{ vendorId: 0x0b66, productId: 0x0042 }, { vendorId: 0x0b66, productId: 0x0041 }];
+
+async function pick() {
+    try {
+        await navigator.usb.requestDevice({ filters: XTREME });
+        return true;
+    } catch (e) {
+        log(`usb: no Xtreme picked (${e.message})`);
+        return false;
+    }
+}
+
 async function connect() {
     const s = settings();
-    if (!emulator) {
-        try {
-            await navigator.usb.requestDevice({ filters: [{ vendorId: 0x0b66, productId: 0x0041 }] });
-        } catch (e) {
-            log(`usb: no Xtreme picked (${e.message})`);
-            return;
-        }
-    }
+    if (!emulator && !await pick()) return;
     state("Starting…");
     worker = new Worker("gate-worker.js");
     worker.onmessage = e => {
@@ -63,6 +71,12 @@ async function connect() {
         if (m.t === "log") log(m.line);
         else if (m.t === "running") { state("Running"); running(true); }
         else if (m.t === "relay") log(m.online ? "chat: on the Internet" : "chat: off the Internet");
+        else if (m.t === "pick") {
+            /* USB Gate came back as a USB device this page may not use yet */
+            log("usb: the Xtreme is back as another USB device (USB Gate running): press \"Pick it again\" and choose it");
+            state("Pick the Xtreme again");
+            $("repick").hidden = false;
+        } else if (m.t === "found") { $("repick").hidden = true; state("Running"); }
         else if (m.t === "stopped") {
             state(m.why ? `Stopped: ${m.why}` : "Stopped");
             running(false);
@@ -75,6 +89,7 @@ async function connect() {
 }
 
 $("connect").onclick = connect;
+$("repick").onclick = pick;
 $("stop").onclick = () => { if (worker) worker.postMessage({ t: "stop" }); state("Stopping…"); };
 $("chatnow").onchange = () => { if (worker) worker.postMessage({ t: "chat", on: $("chatnow").checked }); };
 load();

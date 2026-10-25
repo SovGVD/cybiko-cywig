@@ -18,3 +18,4 @@ _cy_radio_ping = 0xf00000 + 1079;       /* (radio, RF channel): 49db50, sends a 
 _cy_rf = 0xf00000 + 1044;               /* data: the radio's channel object */
 _cy_rf_set_channel = 0xf00000 + 1161;   /* (rf, RF channel 2..9): 49ca04 */
 _cy_rf_channel = 0xf00000 + 1072;       /* (rf): 49ca66 */
+_cy_clock = 0xf00000 + 450;             /* CyOS's clock in 0.1 ms */
