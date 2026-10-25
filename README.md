@@ -41,8 +41,9 @@ make xtreme     # xtreme/USBGate.app (needs gcc-h8300-hms)
 program. On Windows, build in an [MSYS2](https://www.msys2.org/) UCRT64 shell
 with `pacman -S make mingw-w64-ucrt-x86_64-{gcc,pkgconf,libusb,openssl,curl}`
 and `make` (libcurl is the default there); the exe needs the DLLs from
-`/ucrt64/bin` next to it, and the Xtreme needs the WinUSB driver (see
-[In a web browser](#in-a-web-browser)).
+`/ucrt64/bin` next to it. Windows opens the Xtreme while USB Gate runs on
+it (start USB Gate by hand first, see [In a web browser](#in-a-web-browser)
+and [WinUSB without Zadig](#winusb-without-zadig)).
 
 GitHub Actions builds all of it on every push (`.github/workflows/build.yml`):
 the run's artifacts are `cywig-linux-x86_64`, `cywig-windows-x86_64`
