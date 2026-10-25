@@ -1,0 +1,77 @@
+# Builds cywig for Linux and Windows and USB Gate for the Xtreme. The
+# results are the run's artifacts (Actions -> the run -> Artifacts).
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libssl-dev libcurl4-openssl-dev
+      - run: make NET=libcurl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cywig-linux-x86_64
+          path: |
+            build/cywig
+            build/chat_peer
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: >-
+            make
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-libusb
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-curl
+      - run: make
+      - name: Put the DLLs next to cywig.exe
+        run: |
+          mkdir -p dist
+          cp build/cywig.exe build/chat_peer.exe dist/
+          for exe in dist/cywig.exe dist/chat_peer.exe; do
+            ldd "$exe" | awk '$3 ~ /^\/ucrt64\// { print $3 }' | xargs -r cp -n -t dist/
+          done
+          cp xtreme/USBGate.app dist/
+          ls -l dist
+          ./dist/cywig.exe --help || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cywig-windows-x86_64
+          path: dist/
+
+  xtreme:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: sudo apt-get update && sudo apt-get install -y binutils-h8300-hms gcc-h8300-hms
+      - run: sh xtreme/build.sh
+      - name: Compare with the USBGate.app in the repository
+        run: |
+          git diff --quiet -- xtreme/USBGate.app \
+            && echo "xtreme/USBGate.app is up to date" \
+            || echo "::warning file=xtreme/USBGate.app::the built USBGate.app differs from the one in the repository; commit the new one"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: USBGate.app
+          path: xtreme/USBGate.app

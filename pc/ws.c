@@ -2,15 +2,12 @@
 #include "ws.h"
 
 #include <errno.h>
-#include <netdb.h>
-#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "cy_sock.h"
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -38,7 +35,7 @@ static int raw_write(ws_t *w, const void *p, size_t n)
 {
     const char *c = p;
     while (n) {
-        int r = w->ssl ? SSL_write(w->ssl, c, (int)n) : (int)send(w->fd, c, n, MSG_NOSIGNAL);
+        int r = w->ssl ? SSL_write(w->ssl, c, (int)n) : (int)send(w->fd, (const char *)c, (int)n, MSG_NOSIGNAL);
         if (r <= 0) {
             if (!w->ssl && errno == EINTR) continue;
             fail(w, "write failed");
@@ -57,12 +54,12 @@ static int raw_fill(ws_t *w, int ms)
     if (w->in_len == sizeof w->in) { fail(w, "frame too big"); return -1; }
     if (!(w->ssl && SSL_pending(w->ssl))) {
         struct pollfd p = { w->fd, POLLIN, 0 };
-        int r = poll(&p, 1, ms);
+        int r = cy_poll(&p, 1, ms);
         if (r == 0) return 0;
         if (r < 0) return errno == EINTR ? 0 : -1;
     }
     int r = w->ssl ? SSL_read(w->ssl, w->in + w->in_len, (int)(sizeof w->in - w->in_len))
-                   : (int)recv(w->fd, w->in + w->in_len, sizeof w->in - w->in_len, 0);
+                   : (int)recv(w->fd, (char *)w->in + w->in_len, (int)(sizeof w->in - w->in_len), 0);
     if (r <= 0) {
         if (w->ssl && SSL_get_error(w->ssl, r) == SSL_ERROR_WANT_READ) return 0;
         fail(w, "the relay closed the connection");
@@ -93,14 +90,15 @@ static int read_head(ws_t *w, char *out, size_t cap)
 static int dial(ws_t *w, const char *host, const char *port)
 {
     struct addrinfo hints = { 0 }, *res, *a;
+    cy_sock_init();
     hints.ai_socktype = SOCK_STREAM;
     int e = getaddrinfo(host, port, &hints, &res);
     if (e) { fail(w, "%s: %s", host, gai_strerror(e)); return -1; }
     for (a = res; a; a = a->ai_next) {
-        w->fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        w->fd = (int)socket(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (w->fd < 0) continue;
         if (!connect(w->fd, a->ai_addr, a->ai_addrlen)) break;
-        close(w->fd);
+        cy_sock_close(w->fd);
         w->fd = -1;
     }
     freeaddrinfo(res);
@@ -172,6 +170,9 @@ ws_t *ws_open(const char *url, const char *origin, char *err, size_t errlen)
         w->ctx = SSL_CTX_new(TLS_client_method());
         if (!w->ctx) { fail(w, "TLS setup failed"); goto bad; }
         SSL_CTX_set_default_verify_paths(w->ctx);
+#if defined _WIN32 && OPENSSL_VERSION_NUMBER >= 0x30200000L
+        SSL_CTX_load_verify_store(w->ctx, "org.openssl.winstore:");   /* Windows' own certificates */
+#endif
         const char *ca = getenv("SSL_CERT_FILE");
         if (ca) SSL_CTX_load_verify_locations(w->ctx, ca, NULL);
         SSL_CTX_set_verify(w->ctx, SSL_VERIFY_PEER, NULL);
@@ -213,7 +214,7 @@ void ws_close(ws_t *w)
     if (!w) return;
     if (w->ssl) { SSL_shutdown(w->ssl); SSL_free(w->ssl); }
     if (w->ctx) SSL_CTX_free(w->ctx);
-    if (w->fd >= 0) close(w->fd);
+    if (w->fd >= 0) cy_sock_close(w->fd);
     free(w);
 }
 
